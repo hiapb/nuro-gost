@@ -1,7 +1,7 @@
 #!/bin/bash
 
 # =========================================================
-#   Gost v3 面板管理脚本 (轻量版 + 菜单管理)
+#   Gost v3 面板管理脚本
 # =========================================================
 
 # --- 基础配置 ---
@@ -39,9 +39,7 @@ print_info() { echo -e "${CYAN}>>> $1${RESET}"; }
 print_ok() { echo -e "${GREEN}✅ $1${RESET}"; }
 print_err() { echo -e "${RED}❌ $1${RESET}"; }
 
-# =========================================================
-#   功能模块 1: 安装面板 (轻量版核心)
-# =========================================================
+
 install_panel() {
     clear
     echo -e "${GREEN}正在安装 Gost v3 面板...${RESET}"
@@ -87,7 +85,7 @@ install_panel() {
     fi
     mkdir -p "$(dirname "$GOST_CONFIG")"
 
-    # 5. 生成源码 (轻量版，无sysinfo)
+    # 5. 生成源码 
     print_info "生成面板源码..."
     mkdir -p "$WORK_DIR/src" "$WORK_DIR/.cargo"
 
@@ -231,9 +229,7 @@ EOF
     read -p "按回车返回菜单..."
 }
 
-# =========================================================
-#   功能模块 2: 修改配置 (端口/用户/密码)
-# =========================================================
+
 modify_config() {
     clear
     echo -e "${CYAN}>>> 修改面板配置${RESET}"
@@ -314,10 +310,10 @@ while true; do
         echo -e "状态: ${RED}● 未运行${RESET}"
     fi
     echo ""
-    echo -e "1. 安装面板 (Install)"
-    echo -e "2. 修改配置 (Config)"
-    echo -e "3. 卸载面板 (Uninstall)"
-    echo -e "0. 退出 (Exit)"
+    echo -e "1. 安装面板"
+    echo -e "2. 修改配置"
+    echo -e "3. 卸载面板"
+    echo -e "0. 退出"
     echo ""
     read -p "请选择 [0-3]: " choice
 
