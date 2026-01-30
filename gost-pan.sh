@@ -12,9 +12,9 @@ SERVICE_FILE="/etc/systemd/system/gost.service"
 TMP_DIR="/tmp/gost_install"
 
 # 面板路径 
-WORK_DIR="/opt/realm_panel"
-PANEL_BIN="/usr/local/bin/realm-panel"
-PANEL_DATA="/etc/realm/panel_data.json"
+WORK_DIR="/opt/gost_panel"
+PANEL_BIN="/usr/local/bin/gost-panel"
+PANEL_DATA="/etc/gost/panel_data.json"
 
 # 颜色
 GREEN="\033[32m"
