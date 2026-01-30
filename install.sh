@@ -1,133 +1,287 @@
 #!/bin/bash
+set -e
 
 # =================配置区域=================
-PANEL_PORT="4794"
+PANEL_PORT="4795"
 DEFAULT_USER="admin"
 DEFAULT_PASS="123456"
 
-# 路径配置 (改为 Gost 相关路径)
+# 核心路径配置
 GOST_BIN="/usr/local/bin/gost"
 CONFIG_FILE="/etc/gost/config.yaml"
+# 引入中间数据库文件，用于完美模拟 Realm 的管理体验
+RULES_DB="/etc/gost/rules.conf"
+
 SERVICE_FILE="/etc/systemd/system/gost.service"
+PANEL_SERVICE_FILE="/etc/systemd/system/gost-panel.service"
 TMP_DIR="/tmp/gost_install"
 
-# 面板路径 (保持原路径以便兼容旧数据，或者你可以改为 /opt/gost_panel)
-WORK_DIR="/opt/realm_panel"
-PANEL_BIN="/usr/local/bin/realm-panel"
-PANEL_DATA="/etc/realm/panel_data.json"
+GOST_DIR="/etc/gost"
+BACKUP_DIR="/etc/gost/backups"
+DEFAULT_EXPORT_FILE="$BACKUP_DIR/gost-backup.tar.gz"
+DEFAULT_IMPORT_FILE="$BACKUP_DIR/gost-backup.tar.gz"
+
+CRON_FILE="/etc/cron.d/gost-rules-export"
+EXPORT_HELPER="/usr/local/bin/gost-export-rules.sh"
 
 # 颜色
-GREEN="\033[32m"
-RED="\033[31m"
-YELLOW="\033[33m"
-CYAN="\033[36m"
-RESET="\033[0m"
-# =========================================
+GREEN="\e[32m"
+RED="\e[31m"
+YELLOW="\e[33m"
+RESET="\e[0m"
 
-# 自定义链名称 (IPTABLES 流量统计用)
-CHAIN_IN="REALM_IN"
-CHAIN_OUT="REALM_OUT"
+# ================= 基础函数 =================
+
+check_root() {
+  if [ "$EUID" -ne 0 ]; then
+    echo -e "${RED}请以 root 用户运行此脚本。${RESET}"
+    exit 1
+  fi
+}
 
 need_cmd() {
-    if ! command -v "$1" >/dev/null 2>&1; then
-        echo -e "${RED}错误: 缺少必要命令 '$1'${RESET}"
-        exit 1
-    fi
+  command -v "$1" >/dev/null 2>&1 || {
+    echo -e "${RED}缺少依赖命令：$1，请先安装。${RESET}"
+    exit 1
+  }
 }
 
-spinner() {
-    local pid=$1
-    local delay=0.1
-    local spinstr='|/-\'
-    echo -n " "
-    while [ -d /proc/$pid ]; do
-        local temp=${spinstr#?}
-        printf " [%c]  " "$spinstr"
-        local spinstr=$temp${spinstr%"$temp"}
-        sleep $delay
-        printf "\b\b\b\b\b\b"
-    done
-    printf "    \b\b\b\b"
+is_installed() {
+  [ -x "$GOST_BIN" ] && [ -f "$SERVICE_FILE" ]
 }
 
-run_step() {
-    echo -e -n "${CYAN}>>> $1...${RESET}"
-    eval "$2" >/dev/null 2>&1 &
-    spinner $!
-    echo -e "${GREEN} [完成]${RESET}"
+require_installed() {
+  if ! is_installed; then
+    echo -e "${RED}Gost 未安装，请先选择 1 安装。${RESET}"
+    return 1
+  fi
+  return 0
 }
 
-prepare_env_and_fix_compilation() {
-    echo -e "${CYAN}>>> 正在优化编译环境...${RESET}"
-    if [ -f /etc/debian_version ]; then
-        apt-get update -y >/dev/null 2>&1
-        apt-get install -y curl wget tar git build-essential pkg-config libssl-dev iptables >/dev/null 2>&1
-        apt-get install --reinstall -y gcc gcc-10 libgcc-10-dev libgcc-s1 libc6-dev >/dev/null 2>&1
-    elif [ -f /etc/redhat-release ]; then
-        yum groupinstall -y 'Development Tools' >/dev/null 2>&1
-        yum install -y curl wget tar openssl-devel libgcc glibc-static iptables-services >/dev/null 2>&1
-    fi
-
-    if ! command -v cargo &> /dev/null; then
-        echo -e -n "${CYAN}>>> 安装 Rust 编译器...${RESET}"
-        curl --proto '=https' --tlsv1.2 -sSf https://sh.rustup.rs | sh -s -- -y >/dev/null 2>&1 &
-        spinner $!
-        source "$HOME/.cargo/env"
-        echo -e "${GREEN} [完成]${RESET}"
-    else
-        echo -e "${GREEN}>>> Rust 已安装${RESET}"
-    fi
+ensure_config_file() {
+  mkdir -p "$GOST_DIR"
+  if [ ! -f "$RULES_DB" ]; then
+    touch "$RULES_DB"
+  fi
+  if [ ! -f "$CONFIG_FILE" ]; then
+    regenerate_gost_config
+  fi
 }
 
-# 安装 Gost v3
-install_gost_smart() {
-    need_cmd curl
-    need_cmd tar
-    need_cmd systemctl
+# ================= 增强校验函数 (还原原版功能) =================
 
-    echo -e "${CYAN}>>> 检查 Gost 环境...${RESET}"
+validate_name() {
+  local name="$1"
+  [ -z "$name" ] && return 1
+  if [[ ! "$name" =~ ^[0-9a-zA-Z_-]+$ ]]; then
+      # Gost YAML 对名称比较敏感，限制为字母数字下划线
+      return 1 
+  fi
+  return 0
+}
+
+# 检测本机是否有 IPv6
+has_ipv6() { command -v ip >/dev/null 2>&1 || return 1; ip -6 addr show 2>/dev/null | awk '/inet6/ && $2 !~ /^::1/ {ok=1} END{exit ok?0:1}'; }
+
+# 选择监听协议
+choose_listen_mode_v4v6() {
+  while true; do
+    echo "请选择监听协议：" >&2
+    echo "1. IPv4【默认】" >&2
+    echo "2. IPv6" >&2
+    read -p "请选择 [1-2]（默认 1）: " MODE
+    MODE="${MODE:-1}"
+    case "$MODE" in
+      1) echo "v4"; return 0 ;;
+      2)
+        if has_ipv6; then echo "v6"; return 0
+        else echo -e "${RED}本机无可用 IPv6，请改选 IPv4。${RESET}" >&2
+        fi ;;
+      *) echo -e "${RED}无效选项，请重新选择。${RESET}" >&2 ;;
+    esac
+  done
+}
+
+# 检查系统端口占用
+port_in_use_system() {
+  local port="$1"
+  if command -v ss >/dev/null 2>&1; then
+    ss -H -lntu 2>/dev/null | awk '{print $4}' | awk -v p=":$port" '$0 ~ (p"$") {found=1} END{exit found?0:1}'
+    return $?
+  fi
+  if command -v netstat >/dev/null 2>&1; then
+    netstat -lntu 2>/dev/null | awk '{print $4}' | awk -v p=":$port" '$0 ~ (p"$") {found=1} END{exit found?0:1}'
+    return $?
+  fi
+  return 1
+}
+
+# 检查配置冲突 (检查 RULES_DB)
+config_port_conflict() {
+  local port="$1"
+  local exclude_idx="${2:-}" # 排除的行号(修改时用)
+  
+  local i=1
+  while IFS='|' read -r status name listen remote; do
+      if [ -n "$exclude_idx" ] && [ "$i" -eq "$exclude_idx" ]; then
+          ((i++))
+          continue
+      fi
+      
+      # 提取当前规则端口
+      local current_port="${listen##*:}"
+      if [ "$current_port" == "$port" ]; then
+          return 0 # 冲突
+      fi
+      ((i++))
+  done < "$RULES_DB"
+  return 1 # 无冲突
+}
+
+# 智能端口输入提示
+prompt_listen_port_checked() {
+  local exclude_idx="${1:-}" 
+  local current_val="${2:-}"
+  local p=""
+  
+  while true; do
+    read -p "请输入监听端口: " p
+    # 如果用户没输入且有默认值(修改模式)，则保留原值
+    if [ -z "$p" ] && [ -n "$current_val" ]; then echo "$current_val"; return 0; fi
     
-    # 简单的版本检查逻辑
-    if [ -f "$GOST_BIN" ]; then
-        local_ver=$($GOST_BIN -V 2>&1 | awk '{print $2}')
-        echo -e "${GREEN}本地已安装 Gost ($local_ver)，跳过下载${RESET}"
-    else
-        echo -e "${YELLOW}未检测到 Gost，准备下载 v3 版本...${RESET}"
-        # 下载 Gost V3 (根据架构)
-        ARCH=$(uname -m)
-        case "$ARCH" in
-            x86_64) GOST_ARCH="linux_amd64" ;;
-            aarch64) GOST_ARCH="linux_arm64" ;;
-            *) echo -e "${RED}不支持的架构: $ARCH${RESET}"; exit 1 ;;
-        esac
-        
-        # 获取最新 Release (这里简化直接构造 URL，或者使用固定版本保证稳定性)
-        # 使用 GitHub API 获取最新 tag
-        TAG=$(curl -s https://api.github.com/repos/go-gost/gost/releases/latest | grep '"tag_name":' | sed -E 's/.*"([^"]+)".*/\1/')
-        [ -z "$TAG" ] && TAG="v3.0.0" # Fallback
-        
-        URL="https://github.com/go-gost/gost/releases/download/${TAG}/gost_${TAG#v}_${GOST_ARCH}.tar.gz"
-        
-        mkdir -p "$TMP_DIR"
-        if ! curl -L -o "$TMP_DIR/gost.tar.gz" "$URL"; then
-             echo -e "${RED}Gost 下载失败${RESET}"; exit 1
-        fi
-        
-        tar -xzf "$TMP_DIR/gost.tar.gz" -C "$TMP_DIR"
-        mv "$TMP_DIR/gost" "$GOST_BIN"
-        chmod +x "$GOST_BIN"
-        rm -rf "$TMP_DIR"
+    if ! [[ "$p" =~ ^[0-9]+$ ]] || [ "$p" -lt 1 ] || [ "$p" -gt 65535 ]; then
+      echo -e "${RED}端口必须是 1-65535 的数字。${RESET}" >&2
+      continue
     fi
-
-    mkdir -p "$(dirname "$CONFIG_FILE")"
     
-    # 初始化空配置
-    if [ ! -f "$CONFIG_FILE" ]; then
-        echo 'services: []' > "$CONFIG_FILE"
+    # 检查配置冲突
+    if config_port_conflict "$p" "$exclude_idx"; then
+      echo -e "${RED}端口 $p 已被脚本内的其他规则占用，请重新输入。${RESET}" >&2
+      continue
     fi
+    
+    # 检查系统占用
+    if port_in_use_system "$p"; then
+      # 如果是修改模式，且端口没变，不算系统占用(被自己占用了)
+      if [ "$p" != "$current_val" ]; then
+          echo -e "${YELLOW}提示：系统检测到端口 $p 正在被其他程序占用。${RESET}" >&2
+          read -p "仍然使用该端口吗？[y/N]: " ANS
+          case "$ANS" in y|Y) echo "$p"; return 0 ;; *) continue ;; esac
+      fi
+    fi
+    
+    echo "$p"; return 0
+  done
+}
 
-    # 创建 Systemd 服务 (支持 Reload 信号)
-    cat > "$SERVICE_FILE" <<EOF
+# 远程地址输入提示
+prompt_remote_by_mode() {
+  local MODE="$1" REMOTE=""
+  while true; do
+    if [ "$MODE" = "v4" ]; then
+      echo -e "${GREEN}远程目标：IPv4/域名:PORT  例：1.2.3.4:443${RESET}" >&2
+      read -r -p "请输入远程目标: " REMOTE
+      [ -z "$REMOTE" ] && { echo -e "${RED}远程目标不能为空。${RESET}" >&2; continue; }
+      echo "$REMOTE"; return 0
+    else
+      echo -e "${GREEN}远程目标：[IPv6]:PORT  例：[2001:db8::1]:443${RESET}" >&2
+      read -r -p "请输入远程目标: " REMOTE
+      [ -z "$REMOTE" ] && { echo -e "${RED}远程目标不能为空。${RESET}" >&2; continue; }
+      echo "$REMOTE"; return 0
+    fi
+  done
+}
+
+# ================= 服务管理 =================
+
+restart_gost_silent() {
+  if ! systemctl restart gost >/dev/null 2>&1; then
+    systemctl restart gost || true
+  fi
+  # 尝试刷新面板（如果安装了）
+  if [ -f "$PANEL_SERVICE_FILE" ]; then
+      systemctl reload gost-panel >/dev/null 2>&1 || systemctl restart gost-panel >/dev/null 2>&1 || true
+  fi
+}
+
+restart_gost_verbose() {
+  systemctl restart gost
+  echo -e "${GREEN}Gost 服务已重启。${RESET}"
+  if [ -f "$PANEL_SERVICE_FILE" ]; then
+      systemctl restart gost-panel
+      echo -e "${GREEN}Gost 面板已重启。${RESET}"
+  fi
+}
+
+get_gost_version_short() {
+  if [ -x "$GOST_BIN" ]; then
+      $GOST_BIN -V 2>&1 | awk '{print $2}'
+  else
+      echo "未知"
+  fi
+}
+
+get_status_line() {
+  if ! is_installed; then
+    echo -e "状态：${YELLOW}未安装${RESET}"
+    return
+  fi
+  local status ver
+  status="$(systemctl is-active gost 2>/dev/null || true)"
+  ver="$(get_gost_version_short)"
+  if [ "$status" = "active" ]; then
+    echo -e "状态：${GREEN}运行中${RESET}  |  版本：${GREEN}${ver}${RESET}"
+  else
+    echo -e "状态：${RED}未运行${RESET}  |  版本：${GREEN}${ver}${RESET}"
+  fi
+}
+
+# ================= 安装逻辑 =================
+
+install_gost_inner() {
+  need_cmd curl
+  need_cmd tar
+  need_cmd systemctl
+  
+  echo -e "${GREEN}正在安装 Gost V3 ...${RESET}"
+  
+  # 系统优化
+  if [ ! -f "/etc/sysctl.d/99-gost.conf" ]; then
+      cat > /etc/sysctl.d/99-gost.conf <<EOF
+fs.file-max = 1000000
+net.core.rmem_max = 26214400
+net.core.wmem_max = 26214400
+net.ipv4.tcp_max_syn_backlog = 8192
+net.ipv4.tcp_slow_start_after_idle = 0
+EOF
+      sysctl -p /etc/sysctl.d/99-gost.conf >/dev/null 2>&1 || true
+  fi
+
+  ARCH=$(uname -m)
+  case "$ARCH" in
+      x86_64) GOST_ARCH="linux_amd64" ;;
+      aarch64|arm64) GOST_ARCH="linux_arm64" ;;
+      *) echo -e "${RED}不支持的架构: $ARCH${RESET}"; exit 1 ;;
+  esac
+  
+  TAG=$(curl -s https://api.github.com/repos/go-gost/gost/releases/latest | grep '"tag_name":' | sed -E 's/.*"([^"]+)".*/\1/')
+  [ -z "$TAG" ] && TAG="v3.0.0"
+  
+  URL="https://github.com/go-gost/gost/releases/download/${TAG}/gost_${TAG#v}_${GOST_ARCH}.tar.gz"
+  
+  echo -e "${GREEN}下载地址: $URL${RESET}"
+  mkdir -p "$TMP_DIR"
+  if ! curl -L -o "$TMP_DIR/gost.tar.gz" "$URL"; then
+      echo -e "${RED}下载失败${RESET}"
+      exit 1
+  fi
+  
+  tar -xzf "$TMP_DIR/gost.tar.gz" -C "$TMP_DIR"
+  mv "$TMP_DIR/gost" "$GOST_BIN"
+  chmod +x "$GOST_BIN"
+  rm -rf "$TMP_DIR"
+
+  cat > "$SERVICE_FILE" <<EOF
 [Unit]
 Description=Gost Proxy Service
 After=network-online.target
@@ -137,777 +291,526 @@ Wants=network-online.target
 ExecStart=$GOST_BIN -C $CONFIG_FILE
 ExecReload=/bin/kill -HUP \$MAINPID
 Restart=always
-LimitNOFILE=1048576
-LimitNPROC=1048576
+LimitNOFILE=1000000
+LimitNPROC=1000000
 
 [Install]
 WantedBy=multi-user.target
 EOF
 
+  ensure_config_file
+  systemctl daemon-reload
+  systemctl enable gost >/dev/null 2>&1 || true
+  systemctl restart gost
+  
+  echo -e "${GREEN}安装完成。当前版本：$(get_gost_version_short)${RESET}"
+}
+
+install_gost() {
+  if is_installed; then
+    echo -e "${YELLOW}Gost 已安装。是否更新/重装？[y/N]${RESET}"
+    read -r ANS
+    case "$ANS" in
+      y|Y) install_gost_inner ;;
+      *) echo -e "${YELLOW}已取消。${RESET}" ;;
+    esac
+  else
+    install_gost_inner
+  fi
+}
+
+uninstall_gost() {
+  echo -e "${YELLOW}正在卸载 Gost 面板(如果有)...${RESET}"
+  if [ -f "$PANEL_SERVICE_FILE" ]; then
+      systemctl stop gost-panel >/dev/null 2>&1 || true
+      systemctl disable gost-panel >/dev/null 2>&1 || true
+      rm -f "$PANEL_SERVICE_FILE" "$PANEL_BIN"
+  fi
+
+  echo -e "${YELLOW}正在卸载 Gost 主程序...${RESET}"
+  systemctl stop gost >/dev/null 2>&1 || true
+  systemctl disable gost >/dev/null 2>&1 || true
+  rm -f "$GOST_BIN" "$SERVICE_FILE" "$CONFIG_FILE" "$RULES_DB"
+  rm -rf "$GOST_DIR"
+  rm -f /etc/sysctl.d/99-gost.conf
+  systemctl daemon-reload
+  echo -e "${GREEN}Gost 及面板已全部卸载完成。${RESET}"
+}
+
+# ================= 核心：配置生成器 =================
+# 将 rules.conf (简易格式) 转换为 config.yaml (复杂格式)
+regenerate_gost_config() {
+    cat > "$CONFIG_FILE" <<EOF
+services:
+EOF
+    
+    if [ -f "$RULES_DB" ]; then
+        while IFS='|' read -r status name listen remote; do
+            if [ "$status" == "1" ]; then
+                cat >> "$CONFIG_FILE" <<EOF
+  - name: service-${name}-tcp
+    addr: $listen
+    handler:
+      type: tcp
+      chain: chain-${name}
+    listener:
+      type: tcp
+  - name: service-${name}-udp
+    addr: $listen
+    handler:
+      type: udp
+      chain: chain-${name}
+    listener:
+      type: udp
+EOF
+            fi
+        done < "$RULES_DB"
+    fi
+
+    cat >> "$CONFIG_FILE" <<EOF
+chains:
+EOF
+    if [ -f "$RULES_DB" ]; then
+        while IFS='|' read -r status name listen remote; do
+            if [ "$status" == "1" ]; then
+                cat >> "$CONFIG_FILE" <<EOF
+  - name: chain-${name}
+    hops:
+      - nodes:
+        - addr: $remote
+EOF
+            fi
+        done < "$RULES_DB"
+    fi
+    
+    if systemctl is-active gost >/dev/null 2>&1; then
+        systemctl reload gost
+    fi
+}
+
+# ================= 规则管理逻辑 =================
+
+print_rules_pretty() {
+  ensure_config_file
+  if [ ! -s "$RULES_DB" ]; then
+    echo -e "${YELLOW}暂无转发规则。${RESET}"
+    return 1
+  fi
+  
+  echo -e "${GREEN}当前转发规则列表：${RESET}"
+  local i=1
+  while IFS='|' read -r status name listen remote; do
+      local st_text
+      if [ "$status" == "1" ]; then
+          st_text="${GREEN}启用${RESET}"
+      else
+          st_text="${RED}暂停${RESET}"
+      fi
+      echo -e "$i. [$st_text] [$name] $listen -> $remote"
+      ((i++))
+  done < "$RULES_DB"
+  return 0
+}
+
+add_rule() {
+  ensure_config_file
+  local MODE NAME PORT LISTEN REMOTE
+  
+  MODE="$(choose_listen_mode_v4v6)"
+  
+  while true; do
+    read -p "请输入规则备注(仅限字母数字): " NAME
+    if validate_name "$NAME"; then break; fi
+    echo -e "${RED}名称不合法。${RESET}"
+  done
+  
+  PORT="$(prompt_listen_port_checked "" "")"
+  REMOTE="$(prompt_remote_by_mode "$MODE")"
+  
+  # 组装监听地址
+  if [ "$MODE" = "v6" ]; then
+      LISTEN="[::]:$PORT"
+  else
+      LISTEN=":$PORT"
+  fi
+  
+  echo "1|$NAME|$LISTEN|$REMOTE" >> "$RULES_DB"
+  
+  regenerate_gost_config
+  echo -e "${GREEN}规则已添加并应用。${RESET}"
+}
+
+delete_rule() {
+  if ! print_rules_pretty; then return; fi
+  
+  mapfile -t RULES < "$RULES_DB"
+  local count=${#RULES[@]}
+  
+  read -p "请输入要删除的规则编号: " IDX
+  if ! [[ "$IDX" =~ ^[0-9]+$ ]] || [ "$IDX" -lt 1 ] || [ "$IDX" -gt "$count" ]; then
+      echo -e "${RED}编号无效。${RESET}"
+      return
+  fi
+  
+  sed -i "${IDX}d" "$RULES_DB"
+  
+  regenerate_gost_config
+  echo -e "${GREEN}规则已删除并应用。${RESET}"
+}
+
+clear_rules() {
+  > "$RULES_DB"
+  regenerate_gost_config
+  echo -e "${GREEN}所有规则已清空。${RESET}"
+}
+
+toggle_rule() {
+  if ! print_rules_pretty; then return; fi
+  
+  mapfile -t RULES < "$RULES_DB"
+  local count=${#RULES[@]}
+  
+  read -p "请输入要 启用/暂停 的规则编号: " IDX
+  if ! [[ "$IDX" =~ ^[0-9]+$ ]] || [ "$IDX" -lt 1 ] || [ "$IDX" -gt "$count" ]; then
+      echo -e "${RED}编号无效。${RESET}"
+      return
+  fi
+  
+  local line="${RULES[$((IDX-1))]}"
+  local status name listen remote
+  IFS='|' read -r status name listen remote <<< "$line"
+  
+  local new_status
+  if [ "$status" == "1" ]; then new_status="0"; else new_status="1"; fi
+  
+  local new_line="$new_status|$name|$listen|$remote"
+  sed -i "${IDX}s/.*/$new_line/" "$RULES_DB"
+  
+  regenerate_gost_config
+  if [ "$new_status" == "1" ]; then
+      echo -e "${GREEN}规则已启用。${RESET}"
+  else
+      echo -e "${YELLOW}规则已暂停。${RESET}"
+  fi
+}
+
+edit_rule() {
+  if ! print_rules_pretty; then return; fi
+  mapfile -t RULES < "$RULES_DB"
+  local count=${#RULES[@]}
+  
+  read -p "请输入要修改的规则编号: " IDX
+  if ! [[ "$IDX" =~ ^[0-9]+$ ]] || [ "$IDX" -lt 1 ] || [ "$IDX" -gt "$count" ]; then
+      echo -e "${RED}编号无效。${RESET}"
+      return
+  fi
+  
+  # 读取当前数据
+  local line="${RULES[$((IDX-1))]}"
+  local status name listen remote
+  IFS='|' read -r status name listen remote <<< "$line"
+  
+  # 解析当前端口和模式
+  local cur_port="${listen##*:}"
+  local mode="v4"
+  if [[ "$listen" == \[* ]]; then mode="v6"; fi
+  
+  echo -e "${GREEN}当前选中：[$name] $listen -> $remote${RESET}"
+  echo "要修改哪个字段？"
+  echo "1. 备注名称"
+  echo "2. 监听端口"
+  echo "3. 远程目标"
+  echo "0. 返回"
+  read -p "请选择 [0-3]: " OPT
+  
+  case "$OPT" in
+    1)
+      local NEW_NAME
+      while true; do
+        read -p "请输入新名称: " NEW_NAME
+        if validate_name "$NEW_NAME"; then break; fi
+        echo -e "${RED}名称不合法。${RESET}"
+      done
+      name="$NEW_NAME"
+      ;;
+    2)
+      local NEW_PORT
+      # 传入 IDX 以在冲突检测中排除自身
+      NEW_PORT="$(prompt_listen_port_checked "$IDX" "$cur_port")"
+      if [ "$mode" = "v6" ]; then
+          listen="[::]:$NEW_PORT"
+      else
+          listen=":$NEW_PORT"
+      fi
+      ;;
+    3)
+      local NEW_REMOTE
+      NEW_REMOTE="$(prompt_remote_by_mode "$mode")"
+      remote="$NEW_REMOTE"
+      ;;
+    0) return ;;
+    *) echo -e "${RED}无效选项。${RESET}"; return ;;
+  esac
+  
+  # 更新数据库
+  local new_line="$status|$name|$listen|$remote"
+  # 这里需要处理一下转义问题，最稳妥是用 awk 或先删除后插入，简单起见用 sed (只要名称里没特殊符号)
+  sed -i "${IDX}s|.*|$new_line|" "$RULES_DB"
+  
+  regenerate_gost_config
+  echo -e "${GREEN}修改成功并已应用。${RESET}"
+}
+
+# ================= 备份与导入 =================
+
+export_rules() {
+  ensure_config_file
+  mkdir -p "$BACKUP_DIR"
+  read -p "导出文件路径 [默认 ${DEFAULT_EXPORT_FILE}]: " OUT
+  OUT="${OUT:-$DEFAULT_EXPORT_FILE}"
+  
+  echo -e "${GREEN}正在打包规则数据...${RESET}"
+  # 备份 rules.conf, config.yaml 和 面板数据
+  local FILES_TO_BACKUP="rules.conf config.yaml"
+  if [ -f "$PANEL_DATA_FILE" ]; then
+      FILES_TO_BACKUP="$FILES_TO_BACKUP panel_data.json"
+  fi
+  
+  tar -czf "$OUT" -C "$GOST_DIR" $FILES_TO_BACKUP
+  if [ -s "$OUT" ]; then
+    echo -e "${GREEN}导出成功：$OUT${RESET}"
+  else
+    echo -e "${RED}导出失败。${RESET}"
+  fi
+}
+
+import_rules() {
+  ensure_config_file
+  read -p "请输入导入文件路径 [默认 ${DEFAULT_IMPORT_FILE}]: " IN
+  IN="${IN:-$DEFAULT_IMPORT_FILE}"
+  if [ ! -f "$IN" ]; then echo -e "${RED}文件不存在。${RESET}"; return; fi
+  
+  echo -e "${YELLOW}警告：这将覆盖现有规则！${RESET}"
+  read -p "确认覆盖? [y/N]: " ANS
+  case "$ANS" in y|Y) ;; *) return ;; esac
+  
+  tar -xzf "$IN" -C "$GOST_DIR"
+  regenerate_gost_config
+  echo -e "${GREEN}导入成功并已重载配置。${RESET}"
+}
+
+# ================= 杂项与 Cron =================
+
+has_cron() {
+  command -v crontab >/dev/null 2>&1 || command -v cron >/dev/null 2>&1 || command -v crond >/dev/null 2>&1
+}
+
+install_cron() {
+  echo -e "${YELLOW}未检测到 Cron，尝试安装...${RESET}"
+  if [ -f /etc/debian_version ]; then
+    apt update && apt install -y cron
+    systemctl enable cron && systemctl start cron
+  elif [ -f /etc/redhat-release ]; then
+    yum install -y cronie
+    systemctl enable crond && systemctl start crond
+  else
+    echo -e "${RED}无法自动安装 Cron，请手动安装。${RESET}"
+    return 1
+  fi
+}
+
+ensure_cron_ready() {
+  if ! has_cron; then install_cron || return 1; fi
+}
+
+write_export_helper() {
+  mkdir -p "$BACKUP_DIR"
+  cat > "$EXPORT_HELPER" <<EOF
+#!/bin/bash
+set -e
+CONFIG_DIR="/etc/gost"
+BACKUP_DIR="/etc/gost/backups"
+mkdir -p "\$BACKUP_DIR"
+ts="\$(date +%F_%H%M%S)"
+OUT="\$BACKUP_DIR/gost-backup.\${ts}.tar.gz"
+# 备份核心数据
+FILES="rules.conf config.yaml"
+if [ -f "\$CONFIG_DIR/panel_data.json" ]; then
+    FILES="\$FILES panel_data.json"
+fi
+tar -czf "\$OUT" -C "\$CONFIG_DIR" \$FILES 2>/dev/null
+# 保留最近8份
+ls -tp "\$BACKUP_DIR"/gost-backup.*.tar.gz 2>/dev/null | tail -n +8 | xargs -I {} rm -- "{}"
+EOF
+  chmod +x "$EXPORT_HELPER"
+}
+
+schedule_status() {
+  if [ -f "$CRON_FILE" ]; then
+      echo -e "${GREEN}定时备份：已启用${RESET}"
+      cat "$CRON_FILE"
+  else
+      echo -e "${YELLOW}定时备份：未启用${RESET}"
+  fi
+}
+
+setup_export_cron() {
+  ensure_cron_ready || return
+  write_export_helper
+  
+  echo "1. 每天"
+  echo "2. 每周"
+  read -p "选择频率 [1-2]: " T
+  local D="*"
+  if [ "$T" == "2" ]; then
+      read -p "周几 (0-6, 0是周日): " D
+  fi
+  read -p "小时 (0-23): " HH
+  read -p "分钟 (0-59): " MM
+  
+  cat > "$CRON_FILE" <<EOF
+SHELL=/bin/bash
+PATH=/usr/local/sbin:/usr/local/bin:/sbin:/bin:/usr/sbin:/usr/bin
+$MM $HH * * $D root $EXPORT_HELPER >/dev/null 2>&1
+EOF
+  echo -e "${GREEN}任务已添加。${RESET}"
+}
+
+remove_export_cron() {
+  rm -f "$CRON_FILE" "$EXPORT_HELPER"
+  echo -e "${GREEN}定时任务已移除。${RESET}"
+}
+
+manage_schedule_backup() {
+  echo "--------------------"
+  echo "1. 查看状态"
+  echo "2. 添加任务"
+  echo "3. 删除任务"
+  echo "0. 返回"
+  read -p "选择: " X
+  case "$X" in
+    1) schedule_status ;;
+    2) setup_export_cron ;;
+    3) remove_export_cron ;;
+    *) return ;;
+  esac
+}
+
+install_ftp(){
+    clear
+    echo -e "${GREEN}📂 FTP/SFTP 备份工具...${RESET}"
+    echo -e "${YELLOW}默认备份文件：${DEFAULT_EXPORT_FILE}${RESET}"
+    bash <(curl -L https://raw.githubusercontent.com/hiapb/ftp/main/back.sh)
+    sleep 2
+}
+
+# ================= 面板管理 =================
+
+update_panel_port() {
+    if [ ! -f "$PANEL_SERVICE_FILE" ]; then
+        echo -e "${RED}面板未安装。${RESET}"
+        return
+    fi
+    echo -e "${GREEN}修改 Gost 面板端口${RESET}"
+    read -p "新端口 (1-65535): " PORT
+    if ! [[ "$PORT" =~ ^[0-9]+$ ]]; then echo "无效数字"; return; fi
+    
+    # 替换服务文件中的端口变量
+    sed -i "s|Environment=\"PANEL_PORT=.*\"|Environment=\"PANEL_PORT=$PORT\"|g" "$PANEL_SERVICE_FILE"
     systemctl daemon-reload
-    systemctl enable gost >/dev/null 2>&1 || true
-    systemctl restart gost
-    echo -e "${GREEN}Gost v3 安装/更新完成${RESET}"
+    if systemctl restart gost-panel; then
+        local IP
+        IP=$(curl -s4 ifconfig.me || hostname -I | awk '{print $1}')
+        echo -e "${GREEN}修改成功！访问地址: http://${IP}:${PORT}${RESET}"
+    else
+        echo -e "${RED}重启失败。${RESET}"
+    fi
 }
 
-if [ "$EUID" -ne 0 ]; then
-    echo -e "${RED}请以 root 用户运行！${RESET}"
-    exit 1
-fi
-
-clear
-echo -e "${GREEN}==========================================${RESET}"
-echo -e "${GREEN}   Realm 面板 (Gost v3 核心版) 一键部署     ${RESET}"
-echo -e "${GREEN}   特性: TCP+UDP双栈 / 热更新 / 无缝迁移     ${RESET}"
-echo -e "${GREEN}==========================================${RESET}"
-
-prepare_env_and_fix_compilation
-install_gost_smart
-
-mkdir -p "$(dirname "$PANEL_DATA")"
-run_step "生成面板源代码" "
-rm -rf '$WORK_DIR'
-mkdir -p '$WORK_DIR/src'
-"
-cd "$WORK_DIR"
-
-# 注意：添加了 serde_yaml 依赖
-cat > Cargo.toml <<EOF
-[package]
-name = "realm-panel"
-version = "4.0.0"
-edition = "2021"
-
-[dependencies]
-axum = { version = "0.7", features = ["macros"] }
-tokio = { version = "1", features = ["full"] }
-serde = { version = "1", features = ["derive"] }
-serde_json = "1"
-serde_yaml = "0.9"
-tower-cookies = "0.10"
-anyhow = "1.0"
-uuid = { version = "1", features = ["v4"] }
-chrono = { version = "0.4", features = ["serde"] }
-EOF
-
-cat > src/main.rs << 'EOF'
-use axum::{
-    extract::{State, Path},
-    http::StatusCode,
-    response::{Html, IntoResponse, Response},
-    routing::{get, post, put, delete},
-    Json, Router, Form,
-};
-use serde::{Deserialize, Serialize};
-use serde_json::json;
-use std::{fs, process::Command, sync::{Arc, Mutex}, path::Path as FilePath, time::Duration, collections::HashMap, cmp};
-use tower_cookies::{Cookie, Cookies, CookieManagerLayer};
-use chrono::prelude::*;
-
-// 核心配置修改：指向 Gost 的配置文件
-const GOST_CONFIG: &str = "/etc/gost/config.yaml";
-const DATA_FILE: &str = "/etc/realm/panel_data.json";
-
-const CHAIN_IN: &str = "REALM_IN";
-const CHAIN_OUT: &str = "REALM_OUT";
-
-#[derive(Serialize, Deserialize, Clone, Debug)]
-struct Rule {
-    id: String,
-    name: String,
-    listen: String,
-    remote: String,
-    enabled: bool,
-    #[serde(default)]
-    expire_date: u64,
-    #[serde(default)]
-    traffic_limit: u64,
-    #[serde(default)]
-    traffic_used: u64,
-    #[serde(default)]
-    status_msg: String,
+manage_panel() {
+    echo "--------------------"
+    echo "Gost 面板管理："
+    echo "1. 安装面板"
+    echo "2. 卸载面板"
+    echo "3. 修改面板端口" 
+    echo "0. 返回"
+    read -p "请选择 [0-2]: " PAN_OPT
+    case "$PAN_OPT" in
+        1)
+            echo "--------------------"
+            echo "选择安装方式："
+            echo "1. 快速安装部署 (预留)"
+            echo "2. 自编译部署 (预留)"
+            echo "0. 返回"
+            read -p "请选择 [0-2]: " INST_OPT
+            case "$INST_OPT" in
+                # TODO: 替换为实际的 Gost 面板安装脚本 URL
+                1) echo "请先配置正确的脚本地址" ;; 
+                2) echo "请先配置正确的脚本地址" ;;
+                *) return ;;
+            esac
+            ;;
+        2)
+            # TODO: 替换为实际的卸载脚本
+            echo "请先配置正确的卸载脚本地址"
+            ;;
+        3) update_panel_port ;;
+        *) return ;;
+    esac
 }
 
-#[derive(Serialize, Deserialize, Clone, Debug)]
-struct AdminConfig {
-    username: String,
-    pass_hash: String,
-    #[serde(default = "default_bg_pc")]
-    bg_pc: String,
-    #[serde(default = "default_bg_mobile")]
-    bg_mobile: String,
-}
-fn default_bg_pc() -> String { "https://img.inim.im/file/1769439286929_61891168f564c650f6fb03d1962e5f37.jpeg".to_string() }
-fn default_bg_mobile() -> String { "https://img.inim.im/file/1764296937373_bg_m_2.png".to_string() }
+# ================= 主菜单 =================
 
-#[derive(Serialize, Deserialize, Clone, Debug)]
-struct AppData {
-    admin: AdminConfig,
-    rules: Vec<Rule>,
-}
-
-#[derive(Debug, Clone, Copy)]
-struct TrafficStats {
-    in_bytes: u64,
-    out_bytes: u64,
-}
-
-struct AppState {
-    data: Mutex<AppData>,
-    last_traffic_map: Mutex<HashMap<String, TrafficStats>>,
-}
-
-#[tokio::main]
-async fn main() {
-    init_firewall_chains();
-
-    let initial_data = load_or_init_data();
-    let state = Arc::new(AppState {
-        data: Mutex::new(initial_data),
-        last_traffic_map: Mutex::new(HashMap::new()),
-    });
-    
-    // 初始化时同步一次防火墙规则
-    {
-        let data = state.data.lock().unwrap();
-        flush_firewall_chains(); 
-        for rule in &data.rules {
-             if rule.enabled {
-                 add_iptables_rule(rule);
-             }
-        }
-        // 确保 Gost 配置与数据同步
-        save_config_gost(&data);
-    }
-
-    let monitor_state = state.clone();
-    tokio::spawn(async move {
-        loop {
-            tokio::time::sleep(Duration::from_secs(2)).await;
-            update_traffic_and_check(&monitor_state);
-        }
-    });
-
-    let app = Router::new()
-        .route("/", get(index_page))
-        .route("/login", get(login_page).post(login_action))
-        .route("/api/rules", get(get_rules).post(add_rule))
-        .route("/api/rules/batch", post(batch_add_rules))
-        .route("/api/rules/all", delete(delete_all_rules)) 
-        .route("/api/rules/:id", put(update_rule).delete(delete_rule))
-        .route("/api/rules/:id/toggle", post(toggle_rule))
-        .route("/api/rules/:id/reset_traffic", post(reset_traffic))
-        .route("/api/admin/account", post(update_account))
-        .route("/api/admin/bg", post(update_bg))
-        .route("/api/backup", get(download_backup))
-        .route("/api/restore", post(restore_backup))
-        .route("/logout", post(logout_action))
-        .layer(CookieManagerLayer::new())
-        .with_state(state);
-
-    let port = std::env::var("PANEL_PORT").unwrap_or_else(|_| "4794".to_string());
-    println!("Server running on port {}", port);
-    let listener = tokio::net::TcpListener::bind(format!("0.0.0.0:{}", port)).await.unwrap();
-    axum::serve(listener, app).await.unwrap();
+main_menu() {
+  check_root
+  while true; do
+    echo -e "${GREEN}===== Gost V3 转发管理脚本 =====${RESET}"
+    get_status_line
+    echo "----------------------------------"
+    echo "1.  安装 Gost"
+    echo "2.  卸载 Gost"
+    echo "3.  重启 Gost"
+    echo "--------------------"
+    echo "4.  添加转发规则"
+    echo "5.  删除单条规则"
+    echo "6.  删除全部规则"
+    echo "7.  查看当前规则"
+    echo "8.  修改某条规则"
+    echo "9.  启动/暂停某条规则"
+    echo "--------------------"
+    echo "10. 查看日志"
+    echo "11. 查看配置"
+    echo "12. 一键导出规则"
+    echo "13. 一键导入规则"
+    echo "14. 定时备份管理"
+    echo "15. 自动备份到 FTP/SFTP"
+    echo "16. Gost 面板管理" 
+    echo "0.  退出"
+    read -p "请选择 [0-16]: " OPT
+    case "$OPT" in
+      1) install_gost ;;
+      2) uninstall_gost ;;
+      0) exit 0 ;;
+      3) require_installed && restart_gost_verbose ;;
+      4) require_installed && add_rule ;;
+      5) require_installed && delete_rule ;;
+      6) require_installed && clear_rules ;;
+      7) require_installed && print_rules_pretty ;;
+      8) require_installed && edit_rule ;;
+      9) require_installed && toggle_rule ;;
+      10) require_installed && journalctl -u gost --no-pager --since "1 hour ago" ;;
+      11) require_installed && cat "$CONFIG_FILE" ;;
+      12) require_installed && export_rules ;;
+      13) require_installed && import_rules ;;
+      14) require_installed && manage_schedule_backup ;;
+      15) require_installed && install_ftp ;;
+      16) manage_panel ;;  
+      *) echo -e "${RED}无效选项。${RESET}" ;;
+    esac
+    echo -e "${YELLOW}按回车继续...${RESET}"
+    read
+  done
 }
 
-// --- 防火墙相关 (保持不变，因为是基于端口计费，与后端引擎无关) ---
-fn init_firewall_chains() {
-    let _ = Command::new("iptables").args(["-N", CHAIN_IN]).status();
-    let _ = Command::new("iptables").args(["-N", CHAIN_OUT]).status();
-    let check_in = Command::new("iptables").args(["-C", "INPUT", "-j", CHAIN_IN]).status();
-    if check_in.is_err() || !check_in.unwrap().success() {
-        let _ = Command::new("iptables").args(["-I", "INPUT", "-j", CHAIN_IN]).status();
-    }
-    let check_out = Command::new("iptables").args(["-C", "OUTPUT", "-j", CHAIN_OUT]).status();
-    if check_out.is_err() || !check_out.unwrap().success() {
-        let _ = Command::new("iptables").args(["-I", "OUTPUT", "-j", CHAIN_OUT]).status();
-    }
-}
-
-fn flush_firewall_chains() {
-    let _ = Command::new("iptables").args(["-F", CHAIN_IN]).status();
-    let _ = Command::new("iptables").args(["-F", CHAIN_OUT]).status();
-}
-
-fn get_port(listen: &str) -> String {
-    listen.split(':').last().unwrap_or("").trim().to_string()
-}
-
-fn add_iptables_rule(rule: &Rule) {
-    let port = get_port(&rule.listen);
-    if port.is_empty() { return; }
-    for proto in ["tcp", "udp"] {
-        let check_in = Command::new("iptables").args(["-C", CHAIN_IN, "-p", proto, "--dport", &port, "-j", "RETURN"]).status();
-        if check_in.is_err() || !check_in.unwrap().success() {
-            let _ = Command::new("iptables").args(["-A", CHAIN_IN, "-p", proto, "--dport", &port, "-j", "RETURN"]).status();
-        }
-        let check_out = Command::new("iptables").args(["-C", CHAIN_OUT, "-p", proto, "--sport", &port, "-j", "RETURN"]).status();
-        if check_out.is_err() || !check_out.unwrap().success() {
-            let _ = Command::new("iptables").args(["-A", CHAIN_OUT, "-p", proto, "--sport", &port, "-j", "RETURN"]).status();
-        }
-    }
-}
-
-fn remove_iptables_rule(rule: &Rule) {
-    let port = get_port(&rule.listen);
-    if port.is_empty() { return; }
-    for proto in ["tcp", "udp"] {
-        loop {
-            let s = Command::new("iptables").args(["-D", CHAIN_IN, "-p", proto, "--dport", &port, "-j", "RETURN"]).status();
-            if s.is_err() || !s.unwrap().success() { break; }
-        }
-        loop {
-            let s = Command::new("iptables").args(["-D", CHAIN_OUT, "-p", proto, "--sport", &port, "-j", "RETURN"]).status();
-            if s.is_err() || !s.unwrap().success() { break; }
-        }
-    }
-}
-
-fn fetch_iptables_counters() -> HashMap<String, TrafficStats> {
-    let mut map: HashMap<String, TrafficStats> = HashMap::new();
-    let output = match Command::new("iptables-save").arg("-t").arg("filter").arg("-c").output() {
-        Ok(o) => String::from_utf8_lossy(&o.stdout).to_string(),
-        Err(_) => return map,
-    };
-    for line in output.lines() {
-        if !line.starts_with('[') { continue; }
-        let end_bracket = match line.find(']') { Some(i) => i, None => continue };
-        let content = &line[1..end_bracket];
-        let parts: Vec<&str> = content.split(':').collect();
-        if parts.len() != 2 { continue; }
-        let bytes: u64 = parts[1].parse().unwrap_or(0);
-        if bytes == 0 { continue; }
-        
-        let is_in = line.contains(&format!("-A {}", CHAIN_IN));
-        let is_out = line.contains(&format!("-A {}", CHAIN_OUT));
-        if !is_in && !is_out { continue; }
-
-        let port_flag = if is_in { "--dport" } else { "--sport" };
-        if let Some(pos) = line.find(port_flag) {
-            let rest = &line[pos + port_flag.len()..];
-            let port = rest.split_whitespace().next().unwrap_or("");
-            if !port.is_empty() {
-                let entry = map.entry(port.to_string()).or_insert(TrafficStats { in_bytes: 0, out_bytes: 0 });
-                if is_in { entry.in_bytes += bytes; } else { entry.out_bytes += bytes; }
-            }
-        }
-    }
-    map
-}
-
-fn update_traffic_and_check(state: &Arc<AppState>) {
-    let current_counters = fetch_iptables_counters();
-    let mut last_map = state.last_traffic_map.lock().unwrap();
-    let mut data = state.data.lock().unwrap();
-    let now = Utc::now().timestamp_millis() as u64;
-    let mut changed = false;
-
-    for rule in data.rules.iter_mut() {
-        if !rule.enabled { continue; }
-        let port = get_port(&rule.listen);
-        if port.is_empty() { continue; }
-
-        let curr = *current_counters.get(&port).unwrap_or(&TrafficStats{in_bytes:0, out_bytes:0});
-        let last = *last_map.get(&port).unwrap_or(&TrafficStats{in_bytes:0, out_bytes:0});
-
-        let delta_in = if curr.in_bytes >= last.in_bytes { curr.in_bytes - last.in_bytes } else { curr.in_bytes };
-        let delta_out = if curr.out_bytes >= last.out_bytes { curr.out_bytes - last.out_bytes } else { curr.out_bytes };
-        let usage_inc = cmp::max(delta_in, delta_out);
-
-        if usage_inc > 0 {
-            rule.traffic_used += usage_inc;
-            changed = true;
-            last_map.insert(port.clone(), curr);
-        } else {
-            last_map.insert(port.clone(), curr);
-        }
-
-        if rule.expire_date > 0 && now > rule.expire_date {
-            rule.enabled = false;
-            rule.status_msg = "已过期".to_string();
-            changed = true;
-            remove_iptables_rule(rule);
-        }
-
-        if rule.traffic_limit > 0 && rule.traffic_used >= rule.traffic_limit {
-            rule.enabled = false;
-            rule.status_msg = "流量耗尽".to_string();
-            changed = true;
-            remove_iptables_rule(rule);
-        }
-    }
-
-    if changed {
-        save_json(&data);
-        save_config_gost(&data);
-    }
-}
-
-// --------------------------------------------------------
-
-fn load_or_init_data() -> AppData {
-    if let Ok(content) = fs::read_to_string(DATA_FILE) {
-        if let Ok(mut data) = serde_json::from_str::<AppData>(&content) {
-            // 清理旧的 system-keepalive 规则（Gost 不需要）
-            data.rules.retain(|r| r.name != "system-keepalive");
-            return data;
-        }
-    }
-    
-    let admin = AdminConfig {
-        username: std::env::var("PANEL_USER").unwrap_or("admin".to_string()),
-        pass_hash: std::env::var("PANEL_PASS").unwrap_or("123456".to_string()),
-        bg_pc: default_bg_pc(),
-        bg_mobile: default_bg_mobile(),
-    };
-    let data = AppData { admin, rules: Vec::new() };
-    save_json(&data);
-    data
-}
-
-fn save_json(data: &AppData) {
-    let json_str = serde_json::to_string_pretty(data).unwrap();
-    let _ = fs::write(DATA_FILE, json_str);
-}
-
-// 核心改变：生成 Gost v3 的 YAML 配置
-fn save_config_gost(data: &AppData) {
-    let mut services = vec![];
-    let mut chains = vec![];
-
-    for rule in &data.rules {
-        if !rule.enabled { continue; }
-
-        let chain_name = format!("chain-{}", rule.id);
-        
-        // 1. 创建 Chain (定义转发目标)
-        chains.push(json!({
-            "name": chain_name,
-            "hops": [
-                {
-                    "nodes": [
-                        {
-                            "addr": rule.remote
-                        }
-                    ]
-                }
-            ]
-        }));
-
-        // 2. 创建 TCP Service
-        services.push(json!({
-            "name": format!("service-{}-tcp", rule.id),
-            "addr": rule.listen, // Gost 会自动识别并监听
-            "handler": {
-                "type": "tcp",
-                "chain": chain_name
-            },
-            "listener": {
-                "type": "tcp"
-            }
-        }));
-
-        // 3. 创建 UDP Service
-        services.push(json!({
-            "name": format!("service-{}-udp", rule.id),
-            "addr": rule.listen,
-            "handler": {
-                "type": "udp",
-                "chain": chain_name
-            },
-            "listener": {
-                "type": "udp"
-            }
-        }));
-    }
-
-    let config_yaml = json!({
-        "services": services,
-        "chains": chains
-    });
-
-    // 写入配置
-    if let Ok(yaml_str) = serde_yaml::to_string(&config_yaml) {
-        let _ = fs::write(GOST_CONFIG, yaml_str);
-    }
-
-    // 热更新 (HUP Reload)
-    // Gost v3 收到 SIGHUP 会对比配置差异，实现不断流更新
-    let _ = Command::new("systemctl").arg("reload").arg("gost").status();
-}
-
-fn check_auth(cookies: &Cookies, state: &AppData) -> bool {
-    if let Some(cookie) = cookies.get("auth_session") {
-        return cookie.value() == state.admin.pass_hash;
-    }
-    false
-}
-
-// --- 路由处理函数 (逻辑保持不变，调用 save_config_gost 替代 save_config_toml) ---
-
-async fn index_page(cookies: Cookies, State(state): State<Arc<AppState>>) -> Response {
-    let data = state.data.lock().unwrap();
-    if !check_auth(&cookies, &data) { return axum::response::Redirect::to("/login").into_response(); }
-    let html = DASHBOARD_HTML
-        .replace("{{USER}}", &data.admin.username)
-        .replace("{{BG_PC}}", &data.admin.bg_pc)
-        .replace("{{BG_MOBILE}}", &data.admin.bg_mobile);
-    Html(html).into_response()
-}
-
-async fn login_page(State(state): State<Arc<AppState>>) -> Response {
-    let data = state.data.lock().unwrap();
-    let html = LOGIN_HTML
-        .replace("{{BG_PC}}", &data.admin.bg_pc)
-        .replace("{{BG_MOBILE}}", &data.admin.bg_mobile);
-    Html(html).into_response()
-}
-
-#[derive(Deserialize)] struct LoginParams { username: String, password: String }
-async fn login_action(cookies: Cookies, State(state): State<Arc<AppState>>, Form(form): Form<LoginParams>) -> Response {
-    let data = state.data.lock().unwrap();
-    if form.username == data.admin.username && form.password == data.admin.pass_hash {
-        let mut cookie = Cookie::new("auth_session", data.admin.pass_hash.clone());
-        cookie.set_path("/"); cookie.set_http_only(true); 
-        cookie.set_same_site(tower_cookies::cookie::SameSite::Strict);
-        cookies.add(cookie);
-        axum::response::Redirect::to("/").into_response()
-    } else {
-        StatusCode::UNAUTHORIZED.into_response()
-    }
-}
-async fn logout_action(cookies: Cookies) -> Response {
-    let mut cookie = Cookie::new("auth_session", "");
-    cookie.set_path("/"); cookies.remove(cookie);
-    Json(serde_json::json!({"status":"ok"})).into_response()
-}
-
-async fn get_rules(cookies: Cookies, State(state): State<Arc<AppState>>) -> Response {
-    let data = state.data.lock().unwrap();
-    if !check_auth(&cookies, &data) { return StatusCode::UNAUTHORIZED.into_response(); }
-    Json(data.clone()).into_response()
-}
-
-#[derive(Deserialize)] struct AddRuleReq { name: String, listen: String, remote: String, expire_date: u64, traffic_limit: u64 }
-async fn add_rule(cookies: Cookies, State(state): State<Arc<AppState>>, Json(req): Json<AddRuleReq>) -> Response {
-    let mut data = state.data.lock().unwrap();
-    if !check_auth(&cookies, &data) { return StatusCode::UNAUTHORIZED.into_response(); }
-    if req.name.trim().is_empty() || req.listen.trim().is_empty() || req.remote.trim().is_empty() {
-        return Json(serde_json::json!({"status":"error", "message": "所有字段都不能为空！"})).into_response();
-    }
-    let new_port = get_port(&req.listen);
-    if new_port.is_empty() { return Json(serde_json::json!({"status":"error", "message": "端口格式错误"})).into_response(); }
-    if data.rules.iter().any(|r| get_port(&r.listen) == new_port) {
-        return Json(serde_json::json!({"status":"error", "message": "端口已被占用！"})).into_response();
-    }
-    let rule = Rule { 
-        id: uuid::Uuid::new_v4().to_string(), 
-        name: req.name, listen: req.listen, remote: req.remote, enabled: true,
-        expire_date: req.expire_date, traffic_limit: req.traffic_limit, traffic_used: 0, status_msg: String::new()
-    };
-    add_iptables_rule(&rule);
-    data.rules.push(rule);
-    save_json(&data); save_config_gost(&data);
-    Json(serde_json::json!({"status":"ok"})).into_response()
-}
-
-async fn batch_add_rules(cookies: Cookies, State(state): State<Arc<AppState>>, Json(reqs): Json<Vec<AddRuleReq>>) -> Response {
-    let mut data = state.data.lock().unwrap();
-    if !check_auth(&cookies, &data) { return StatusCode::UNAUTHORIZED.into_response(); }
-    let mut added_count = 0;
-    for req in reqs {
-        let new_port = get_port(&req.listen);
-        if new_port.is_empty() { continue; }
-        if data.rules.iter().any(|r| get_port(&r.listen) == new_port) { continue; }
-        let rule = Rule { 
-            id: uuid::Uuid::new_v4().to_string(), 
-            name: req.name, listen: req.listen, remote: req.remote, enabled: true,
-            expire_date: 0, traffic_limit: 0, traffic_used: 0, status_msg: String::new()
-        };
-        add_iptables_rule(&rule);
-        data.rules.push(rule);
-        added_count += 1;
-    }
-    if added_count > 0 { save_json(&data); save_config_gost(&data); }
-    Json(serde_json::json!({"status":"ok", "message": format!("成功添加 {} 条规则", added_count)})).into_response()
-}
-
-async fn delete_all_rules(cookies: Cookies, State(state): State<Arc<AppState>>) -> Response {
-    let mut data = state.data.lock().unwrap();
-    if !check_auth(&cookies, &data) { return StatusCode::UNAUTHORIZED.into_response(); }
-    flush_firewall_chains();
-    data.rules.clear();
-    save_json(&data); save_config_gost(&data); 
-    Json(serde_json::json!({"status":"ok", "message": "所有规则已清空"})).into_response()
-}
-
-async fn download_backup(cookies: Cookies, State(state): State<Arc<AppState>>) -> Response {
-    let data = state.data.lock().unwrap();
-    if !check_auth(&cookies, &data) { return StatusCode::UNAUTHORIZED.into_response(); }
-    let json_str = serde_json::to_string_pretty(&data.rules).unwrap();
-    Response::builder()
-        .header("Content-Type", "application/json")
-        .header("Content-Disposition", "attachment; filename=\"realm_backup.json\"")
-        .body(axum::body::Body::from(json_str))
-        .unwrap()
-}
-
-async fn restore_backup(cookies: Cookies, State(state): State<Arc<AppState>>, Json(backup_rules): Json<Vec<Rule>>) -> Response {
-    let mut data = state.data.lock().unwrap();
-    if !check_auth(&cookies, &data) { return StatusCode::UNAUTHORIZED.into_response(); }
-    if backup_rules.is_empty() { return Json(serde_json::json!({"status": "error", "message": "导入的数据为空"})).into_response(); }
-    flush_firewall_chains();
-    data.rules = backup_rules;
-    for r in &data.rules { if r.enabled { add_iptables_rule(r); } }
-    save_json(&data); save_config_gost(&data);
-    Json(serde_json::json!({"status":"ok", "message": format!("成功恢复 {} 条规则", data.rules.len())})).into_response()
-}
-
-async fn toggle_rule(cookies: Cookies, State(state): State<Arc<AppState>>, Path(id): Path<String>) -> Response {
-    let mut data = state.data.lock().unwrap();
-    if !check_auth(&cookies, &data) { return StatusCode::UNAUTHORIZED.into_response(); }
-    if let Some(rule) = data.rules.iter_mut().find(|r| r.id == id) { 
-        rule.enabled = !rule.enabled;
-        if rule.enabled { 
-            rule.status_msg = String::new(); 
-            add_iptables_rule(rule);
-        } else {
-            remove_iptables_rule(rule);
-        }
-        save_json(&data); save_config_gost(&data); 
-    }
-    Json(serde_json::json!({"status":"ok"})).into_response()
-}
-
-async fn reset_traffic(cookies: Cookies, State(state): State<Arc<AppState>>, Path(id): Path<String>) -> Response {
-    let mut data = state.data.lock().unwrap();
-    if !check_auth(&cookies, &data) { return StatusCode::UNAUTHORIZED.into_response(); }
-    if let Some(rule) = data.rules.iter_mut().find(|r| r.id == id) { 
-        rule.traffic_used = 0;
-        rule.status_msg = String::new(); 
-        if rule.enabled { add_iptables_rule(rule); }
-        save_json(&data); 
-    }
-    Json(serde_json::json!({"status":"ok"})).into_response()
-}
-
-async fn delete_rule(cookies: Cookies, State(state): State<Arc<AppState>>, Path(id): Path<String>) -> Response {
-    let mut data = state.data.lock().unwrap();
-    if !check_auth(&cookies, &data) { return StatusCode::UNAUTHORIZED.into_response(); }
-    if let Some(pos) = data.rules.iter().position(|r| r.id == id) {
-        remove_iptables_rule(&data.rules[pos]);
-        data.rules.remove(pos);
-    }
-    save_json(&data); save_config_gost(&data);
-    Json(serde_json::json!({"status":"ok"})).into_response()
-}
-
-#[derive(Deserialize)] struct UpdateRuleReq { name: String, listen: String, remote: String, expire_date: u64, traffic_limit: u64 }
-async fn update_rule(cookies: Cookies, State(state): State<Arc<AppState>>, Path(id): Path<String>, Json(req): Json<UpdateRuleReq>) -> Response {
-    let mut data = state.data.lock().unwrap();
-    if !check_auth(&cookies, &data) { return StatusCode::UNAUTHORIZED.into_response(); }
-    let new_port = get_port(&req.listen);
-    if data.rules.iter().any(|r| r.id != id && get_port(&r.listen) == new_port) {
-        return Json(serde_json::json!({"status":"error", "message": "端口已被占用！"})).into_response();
-    }
-    if let Some(idx) = data.rules.iter().position(|r| r.id == id) {
-        remove_iptables_rule(&data.rules[idx]);
-        let rule = &mut data.rules[idx];
-        rule.name = req.name; 
-        rule.listen = req.listen; 
-        rule.remote = req.remote;
-        rule.expire_date = req.expire_date;
-        rule.traffic_limit = req.traffic_limit;
-        if rule.enabled {
-             if rule.status_msg == "流量耗尽" && (req.traffic_limit == 0 || req.traffic_limit > rule.traffic_used) {
-                 rule.status_msg = String::new();
-             }
-             add_iptables_rule(rule);
-        }
-        save_json(&data); save_config_gost(&data); 
-    }
-    Json(serde_json::json!({"status":"ok"})).into_response()
-}
-
-#[derive(Deserialize)] struct AccountUpdate { username: String, password: String }
-async fn update_account(cookies: Cookies, State(state): State<Arc<AppState>>, Json(req): Json<AccountUpdate>) -> Response {
-    let mut data = state.data.lock().unwrap();
-    if !check_auth(&cookies, &data) { return StatusCode::UNAUTHORIZED.into_response(); }
-    data.admin.username = req.username;
-    if !req.password.is_empty() { data.admin.pass_hash = req.password; }
-    let mut cookie = Cookie::new("auth_session", data.admin.pass_hash.clone());
-    cookie.set_path("/"); cookie.set_http_only(true); cookies.add(cookie); save_json(&data);
-    Json(serde_json::json!({"status":"ok"})).into_response()
-}
-
-#[derive(Deserialize)] struct BgUpdate { bg_pc: String, bg_mobile: String }
-async fn update_bg(cookies: Cookies, State(state): State<Arc<AppState>>, Json(req): Json<BgUpdate>) -> Response {
-    let mut data = state.data.lock().unwrap();
-    if !check_auth(&cookies, &data) { return StatusCode::UNAUTHORIZED.into_response(); }
-    data.admin.bg_pc = req.bg_pc; data.admin.bg_mobile = req.bg_mobile; save_json(&data);
-    Json(serde_json::json!({"status":"ok"})).into_response()
-}
-
-// === HTML 模板保持完全不变 ===
-const LOGIN_HTML: &str = r#"
-<!DOCTYPE html><html><head><meta charset="utf-8"><meta name="viewport" content="width=device-width, initial-scale=1, maximum-scale=1, user-scalable=no"><title>Realm Login</title><style>*{margin:0;padding:0;box-sizing:border-box}body{height:100vh;width:100vw;overflow:hidden;display:flex;justify-content:center;align-items:center;font-family:-apple-system,BlinkMacSystemFont,"Segoe UI",Roboto,sans-serif;background:url('{{BG_PC}}') no-repeat center center/cover;color:#374151}@media(max-width:768px){body{background-image:url('{{BG_MOBILE}}')}}.overlay{position:absolute;top:0;left:0;width:100%;height:100%;background:rgba(0,0,0,0.05)}.box{position:relative;z-index:2;background:rgba(255,255,255,0.3);backdrop-filter:blur(25px);-webkit-backdrop-filter:blur(25px);padding:2.5rem;border-radius:24px;border:1px solid rgba(255,255,255,0.4);box-shadow:0 8px 32px rgba(0,0,0,0.05);width:90%;max-width:380px;text-align:center}h2{margin-bottom:2rem;color:#374151;font-weight:600;letter-spacing:1px}input{width:100%;padding:14px;margin-bottom:1.2rem;border:1px solid rgba(255,255,255,0.5);border-radius:12px;outline:none;background:rgba(255,255,255,0.5);transition:0.3s;color:#374151}input:focus{background:rgba(255,255,255,0.9);border-color:#3b82f6}button{width:100%;padding:14px;background:rgba(59,130,246,0.85);color:white;border:none;border-radius:12px;cursor:pointer;font-weight:600;font-size:1rem;transition:0.3s;backdrop-filter:blur(5px)}button:hover{background:#2563eb;transform:translateY(-1px)}</style></head><body><div class="overlay"></div><div class="box"><h2>Realm Panel</h2><form onsubmit="doLogin(event)"><input type="text" id="u" placeholder="Username" required><input type="password" id="p" placeholder="Password" required><button type="submit" id="btn">登 录</button></form></div><script>async function doLogin(e){e.preventDefault();const b=document.getElementById('btn');b.innerText='登录中...';b.disabled=true;const res=await fetch('/login',{method:'POST',headers:{'Content-Type':'application/x-www-form-urlencoded'},body:`username=${encodeURIComponent(document.getElementById('u').value)}&password=${encodeURIComponent(document.getElementById('p').value)}`});if(res.redirected){location.href=res.url}else if(res.ok){location.href='/'}else{alert('用户名或密码错误');b.innerText='登 录';b.disabled=false}}</script></body></html>
-"#;
-
-const DASHBOARD_HTML: &str = r#"
-<!DOCTYPE html><html><head><meta charset="utf-8"><meta name="viewport" content="width=device-width, initial-scale=1, maximum-scale=1, user-scalable=no, viewport-fit=cover"><title>Realm Panel</title><link href="https://cdnjs.cloudflare.com/ajax/libs/font-awesome/6.0.0/css/all.min.css" rel="stylesheet"><style>:root{--primary:#3b82f6;--danger:#f87171;--success:#34d399;--text-main:#374151}::-webkit-scrollbar{width:5px;height:5px}::-webkit-scrollbar-thumb{background:rgba(0,0,0,0.1);border-radius:10px}*{box-sizing:border-box}body{font-family:-apple-system,BlinkMacSystemFont,"Segoe UI",Roboto,sans-serif;margin:0;padding:0;height:100vh;height:100dvh;overflow:hidden;background:url('{{BG_PC}}') no-repeat center center/cover;display:flex;flex-direction:column;color:var(--text-main)}@media(max-width:768px){body{background-image:url('{{BG_MOBILE}}')}}.navbar{flex:0 0 auto;background:rgba(255,255,255,0.3);backdrop-filter:blur(25px);-webkit-backdrop-filter:blur(25px);border-bottom:1px solid rgba(255,255,255,0.3);padding:0.8rem 2rem;display:flex;justify-content:space-between;align-items:center;z-index:10}.brand{font-weight:700;font-size:1.1rem;color:var(--text-main);display:flex;align-items:center;gap:10px}.container{flex:1;display:flex;flex-direction:column;max-width:1100px;margin:1.5rem auto;width:95%;overflow:hidden}.card-fixed{background:rgba(255,255,255,0.3);backdrop-filter:blur(20px);border:1px solid rgba(255,255,255,0.4);border-radius:18px;padding:1.2rem;margin-bottom:1.5rem;box-shadow:0 4px 15px rgba(0,0,0,0.03)}.card-scroll{flex:1;background:rgba(255,255,255,0.25);backdrop-filter:blur(20px);border:1px solid rgba(255,255,255,0.4);border-radius:18px;display:flex;flex-direction:column;overflow:hidden;box-shadow:0 4px 15px rgba(0,0,0,0.03)}.table-wrapper{flex:1;overflow-y:auto;padding:0 1.5rem 1.5rem}table{width:100%;border-collapse:separate;border-spacing:0 10px}
-thead th{position:sticky;top:0;background:rgba(255,255,255,0.4);backdrop-filter:blur(15px);z-index:5;padding:14px 12px;text-align:left;font-size:0.85rem;text-transform:uppercase;letter-spacing:1px;color:#6b7280;border-top:1px solid rgba(255,255,255,0.3);border-bottom:1px solid rgba(255,255,255,0.3)}
-thead th:first-child{border-top-left-radius:15px;border-bottom-left-radius:15px;border-left:1px solid rgba(255,255,255,0.3)}
-thead th:last-child{border-top-right-radius:15px;border-bottom-right-radius:15px;border-right:1px solid rgba(255,255,255,0.3)}
-tbody tr{background:transparent;transition:0.3s}
-@media(min-width:768px){tbody tr:hover td{background:rgba(255,255,255,0.7);transform:translateY(-1px);box-shadow:0 4px 10px rgba(0,0,0,0.02)}}
-td{background:rgba(255,255,255,0.4);padding:14px 12px;font-size:0.92rem;font-weight:500;color:var(--text-main);border-top:1px solid rgba(255,255,255,0.3);border-bottom:1px solid rgba(255,255,255,0.3)}
-td:first-child{border-left:1px solid rgba(255,255,255,0.3);border-top-left-radius:15px;border-bottom-left-radius:15px}
-td:last-child{border-right:1px solid rgba(255,255,255,0.3);border-top-right-radius:15px;border-bottom-right-radius:15px}
-.btn{padding:8px 12px;border-radius:10px;border:none;cursor:pointer;color:white;transition:0.2s;display:inline-flex;align-items:center;justify-content:center;gap:6px;font-weight:500}.btn-primary{background:var(--primary);opacity:0.9}.btn-danger{background:var(--danger);opacity:0.9}.btn-gray{background:rgba(0,0,0,0.05);color:var(--text-main)}.grid-input{display:grid;grid-template-columns:1.5fr 1fr 2fr auto auto;gap:12px}
-.tools-group{display:flex;gap:5px}input{padding:10px 14px;border:1px solid rgba(0,0,0,0.05);background:rgba(255,255,255,0.5);border-radius:10px;outline:none;transition:0.3s;color:var(--text-main);font-weight:500}input:focus{border-color:var(--primary);background:white}.status-dot{height:7px;width:7px;border-radius:50%;display:inline-block;margin-right:8px}.bg-green{background:var(--success);box-shadow:0 0 8px var(--success)}.bg-gray{background:#9ca3af}.bg-red{background:var(--danger)}.modal{display:none;position:fixed;top:0;left:0;width:100%;height:100%;background:rgba(0,0,0,0.1);z-index:100;justify-content:center;align-items:center;backdrop-filter:blur(8px)}.modal-box{background:rgba(255,255,255,0.9);width:90%;max-width:420px;padding:2rem;border-radius:20px;box-shadow:0 20px 40px rgba(0,0,0,0.1);animation:pop 0.3s ease}@keyframes pop{from{transform:scale(0.9);opacity:0}to{transform:scale(1);opacity:1}}.tab-header{display:flex;gap:20px;margin-bottom:20px;border-bottom:1px solid rgba(0,0,0,0.05)}.tab-btn{padding:10px 5px;cursor:pointer;font-size:0.9rem;color:#9ca3af}.tab-btn.active{color:var(--primary);border-bottom:2px solid var(--primary);font-weight:600}.tab-content{display:none}.tab-content.active{display:block}label{display:block;margin:12px 0 6px;font-size:0.85rem;color:#6b7280}
-.info-row{display:flex;justify-content:space-between;margin-bottom:8px;font-size:0.9rem}.info-val{font-weight:600}
-.progress-bar{width:100%;height:10px;background:rgba(0,0,0,0.1);border-radius:5px;overflow:hidden;margin-top:5px}.progress-fill{height:100%;background:var(--primary);width:0%}
-.expire-warning{color:var(--danger);font-size:0.8rem;margin-top:2px}
-@media(max-width:768px){.grid-input{grid-template-columns:1fr; gap:10px}.navbar{padding:0.8rem 1rem}.nav-text{display:none}thead{display:none}tbody tr{display:flex;flex-direction:column;border-radius:18px!important;margin-bottom:12px;padding:15px;border:1px solid rgba(255,255,255,0.3);background:rgba(255,255,255,0.4)}td{padding:6px 0;display:flex;justify-content:space-between;border-radius:0!important;align-items:center;border:none;background:transparent}td::before{content:attr(data-label);color:#9ca3af;font-size:0.85rem}td[data-label="操作"]{justify-content:flex-end;gap:10px;margin-top:8px;padding-top:10px;border-top:1px solid rgba(0,0,0,0.05)}td[data-label="操作"] .btn{flex:none;width:auto;padding:6px 14px;border-radius:8px;font-size:0.85rem}td[data-label="操作"] .btn-gray{background:transparent;border:1px solid rgba(0,0,0,0.15);color:#555}td[data-label="操作"] .btn-primary{background:var(--primary);color:white}td[data-label="操作"] .btn-danger{background:rgba(239,68,68,0.1);color:var(--danger);border:1px solid rgba(239,68,68,0.2)}.tools-group{width:100%;margin-top:5px}.tools-group .btn{flex:1;justify-content:center;padding:10px 0;font-size:0.85rem}}</style></head><body><div class="navbar"><div class="brand"><i class="fas fa-layer-group"></i> <span class="nav-text">Realm 转发面板</span></div><div class="nav-actions" style="display:flex;gap:15px"><button class="btn btn-gray" onclick="openSettings()"><i class="fas fa-sliders-h"></i> <span class="nav-text">面板设置</span></button><button class="btn btn-danger" onclick="doLogout()"><i class="fas fa-power-off"></i></button></div></div><div class="container"><div class="card card-fixed"><div class="grid-input"><input id="n" placeholder="备注名称"><input id="l" placeholder="监听端口 (如 10000)"><input id="r" placeholder="目标 (例 1.2.3.4:443)"><button class="btn btn-primary" onclick="openAddModal()"><i class="fas fa-plus"></i> 添加</button><div class="tools-group"><button class="btn btn-primary" onclick="openBatch()" style="background:#8b5cf6"><i class="fas fa-paste"></i> 批量</button><button class="btn btn-danger" onclick="delAll()" style="background:#ef4444"><i class="fas fa-trash"></i> 全删</button><button class="btn btn-primary" onclick="downloadBackup()" style="background:#059669"><i class="fas fa-download"></i> 导出</button><button class="btn btn-danger" onclick="openRestore()" style="background:#d97706"><i class="fas fa-upload"></i> 导入</button></div></div></div><div class="card card-scroll"><div style="padding:1.2rem 1.5rem;font-weight:700;font-size:1rem;opacity:0.8">转发规则管理</div><div class="table-wrapper"><table id="ruleTable"><thead><tr><th>状态</th><th>备注</th><th>监听</th><th>目标</th><th>流量 (In/Out)</th><th style="width:180px;text-align:right;padding-right:20px">操作</th></tr></thead><tbody id="list"></tbody></table><div id="emptyView" style="display:none;text-align:center;padding:50px;color:#9ca3af"><i class="fas fa-inbox" style="font-size:2rem;display:block;margin-bottom:10px"></i>暂无规则</div></div></div></div>
-<div id="ruleModal" class="modal"><div class="modal-box"><h3 id="modalTitle">添加规则</h3><input type="hidden" id="edit_id"><label>备注</label><input id="mod_n"><label>监听端口</label><input id="mod_l"><label>目标地址</label><input id="mod_r"><label>到期时间 (留空不限制)</label><input type="datetime-local" id="mod_e"><label>流量限制 (留空或0不限制)</label><div style="display:flex;gap:10px"><input id="mod_t_val" type="number" placeholder="数值" style="flex:1"><select id="mod_t_unit" style="padding:10px;border-radius:10px;border:1px solid rgba(0,0,0,0.05);background:rgba(255,255,255,0.5)"><option value="MB">MB</option><option value="GB">GB</option></select></div><div style="margin-top:25px;display:flex;justify-content:flex-end;gap:12px"><button class="btn btn-gray" onclick="closeModal()">取消</button><button class="btn btn-primary" onclick="saveRule()">保存</button></div></div></div>
-<div id="viewModal" class="modal"><div class="modal-box"><h3 style="margin-bottom:20px;border-bottom:1px solid #eee;padding-bottom:10px">规则详情</h3><div class="info-row"><span>备注</span><span class="info-val" id="view_n"></span></div><div class="info-row"><span>监听</span><span class="info-val" id="view_l"></span></div><div class="info-row"><span>目标</span><span class="info-val" id="view_r"></span></div><div style="margin:15px 0;border-top:1px dashed #ddd;padding-top:10px"></div><div id="view_expire_sec"><div class="info-row"><span>到期时间</span><span class="info-val" id="view_e_date"></span></div><div style="text-align:right;font-size:0.8rem;color:#666" id="view_e_remain"></div></div><div style="margin:15px 0;border-top:1px dashed #ddd;padding-top:10px"></div><div id="view_traffic_sec"><div class="info-row"><span>流量使用 (Max)</span><span class="info-val"><span id="view_t_used"></span> / <span id="view_t_limit"></span></span></div><div class="progress-bar"><div class="progress-fill" id="view_t_bar"></div></div><div style="text-align:right;margin-top:5px"><button class="btn btn-gray" style="font-size:0.7rem;padding:4px 8px" onclick="resetTraffic()">重置流量</button></div></div><div style="margin-top:25px;display:flex;justify-content:flex-end;"><button class="btn btn-primary" onclick="closeModal()">关闭</button></div></div></div>
-<div id="setModal" class="modal"><div class="modal-box"><div class="tab-header"><div class="tab-btn active" onclick="switchTab(0)">管理账户</div><div class="tab-btn" onclick="switchTab(1)">个性背景</div></div><div class="tab-content active" id="tab0"><label>用户名</label><input id="set_u" value="{{USER}}"><label>重置密码 (留空保持不变)</label><input id="set_p" type="password"><div style="margin-top:25px;display:flex;justify-content:flex-end;gap:12px"><button class="btn btn-gray" onclick="closeModal()">取消</button><button class="btn btn-primary" onclick="saveAccount()">确认修改</button></div></div><div class="tab-content" id="tab1"><label>PC端壁纸 URL</label><input id="bg_pc" value="{{BG_PC}}"><label>手机端壁纸 URL</label><input id="bg_mob" value="{{BG_MOBILE}}"><div style="margin-top:25px;display:flex;justify-content:flex-end;gap:12px"><button class="btn btn-gray" onclick="closeModal()">取消</button><button class="btn btn-primary" onclick="saveBg()">应用背景</button></div></div></div></div>
-<div id="batchModal" class="modal"><div class="modal-box" style="max-width:600px"><h3>批量添加规则</h3><p style="color:#666;font-size:0.85rem;margin-bottom:10px">格式：备注,监听端口,目标地址<br>一行一条，例如：<br>日本落地,10001,1.1.1.1:443</p><textarea id="batch_input" rows="10" style="width:100%;padding:10px;border:1px solid #ddd;border-radius:10px;font-family:monospace" placeholder="备注,监听端口,目标地址"></textarea><div style="margin-top:25px;display:flex;justify-content:flex-end;gap:12px"><button class="btn btn-gray" onclick="closeModal()">取消</button><button class="btn btn-primary" onclick="saveBatch()">开始导入</button></div></div></div>
-<div id="restoreModal" class="modal"><div class="modal-box"><h3>恢复备份</h3><p style="color:#ef4444;font-size:0.9rem;margin-bottom:15px">警告：导入操作将覆盖当前所有规则！</p><textarea id="restore_input" rows="8" style="width:100%;padding:10px;border:1px solid #ddd;border-radius:10px;font-family:monospace;font-size:0.8rem"></textarea><div style="margin-top:25px;display:flex;justify-content:flex-end;gap:12px"><button class="btn btn-gray" onclick="closeModal()">取消</button><button class="btn btn-danger" onclick="doRestore()">确认覆盖</button></div></div></div>
-<script>
-let rules=[];let curId=null;
-const $=id=>document.getElementById(id);
-const fmtBytes=b=>{if(b===0)return'0 B';const k=1024,dm=2,sizes=['B','KB','MB','GB','TB'],i=Math.floor(Math.log(b)/Math.log(k));return parseFloat((b/Math.pow(k,i)).toFixed(dm))+' '+sizes[i]};
-const fmtDate=ts=>{if(!ts)return'永久有效';return new Date(ts).toLocaleString()};
-const getRemain=ts=>{
-    if(!ts) return '';
-    const now=Date.now();
-    const diff=ts-now;
-    if(diff<0) return '已过期';
-    const d = Math.floor(diff / (1000 * 60 * 60 * 24));
-    const h = Math.floor((diff % (1000 * 60 * 60 * 24)) / (1000 * 60 * 60));
-    return `剩余 ${d}天 ${h}小时`;
-};
-async function load(){const r=await fetch('/api/rules');if(r.status===401)location.href='/login';const d=await r.json();rules=d.rules;render()}
-function render(){const t=$('list');const ev=$('emptyView');const table=$('ruleTable');t.innerHTML='';if(rules.length===0){ev.style.display='block';table.style.display='none'}else{ev.style.display='none';table.style.display='table';rules.forEach(r=>{const row=document.createElement('tr');if(!r.enabled)row.style.opacity='0.6';
-let statusHtml=`<span class="status-dot ${r.enabled?'bg-green':'bg-gray'}"></span>${r.enabled?'在线':'暂停'}`;
-if(r.status_msg) statusHtml+=` <span style="font-size:0.8rem;color:#ef4444">(${r.status_msg})</span>`;
-const btns=`<button class="btn btn-gray" onclick="openView('${r.id}')"><i class="fas fa-eye"></i></button><button class="btn btn-gray" onclick="tog('${r.id}')"><i class="fas ${r.enabled?'fa-pause':'fa-play'}"></i></button><button class="btn btn-primary" onclick="openEdit('${r.id}')"><i class="fas fa-edit"></i></button><button class="btn btn-danger" onclick="del('${r.id}')"><i class="fas fa-trash-alt"></i></button>`;
-const isMob=window.innerWidth<768;
-let tfStr = fmtBytes(r.traffic_used);
-if(r.traffic_limit > 0) tfStr += ` / ${fmtBytes(r.traffic_limit)}`;
-if(isMob){row.innerHTML=`<td data-label="状态">${statusHtml}</td><td data-label="备注"><strong>${r.name}</strong></td><td data-label="监听">${r.listen}</td><td data-label="目标">${r.remote}</td><td data-label="流量">${tfStr}</td><td data-label="操作">${btns.replace(/class="btn/g,'class="btn btn-sm')}</td>`;}
-else{row.innerHTML=`<td data-label="状态">${statusHtml}</td><td data-label="备注"><strong>${r.name}</strong></td><td data-label="监听">${r.listen}</td><td data-label="目标">${r.remote}</td><td data-label="流量">${tfStr}</td><td data-label="操作" style="display:flex;gap:6px;justify-content:flex-end;padding-right:15px">${btns}</td>`;}t.appendChild(row)})}}
-function openAddModal(){curId=null;$('modalTitle').innerText='添加规则';['n','l','r','e','t_val'].forEach(x=>$('mod_'+x).value='');
-const qn=$('n').value.trim();const ql=$('l').value.trim();const qr=$('r').value.trim();if(qn)$('mod_n').value=qn;if(ql)$('mod_l').value=ql;if(qr)$('mod_r').value=qr;
-$('ruleModal').style.display='flex'}
-function openEdit(id){curId=id;const r=rules.find(x=>x.id===id);$('modalTitle').innerText='编辑规则';$('mod_n').value=r.name;$('mod_l').value=r.listen.replace('0.0.0.0:','');$('mod_r').value=r.remote;
-if(r.expire_date){const dt=new Date(r.expire_date);dt.setMinutes(dt.getMinutes()-dt.getTimezoneOffset());$('mod_e').value=dt.toISOString().slice(0,16)}else{$('mod_e').value=''}
-if(r.traffic_limit){if(r.traffic_limit>=1073741824){$('mod_t_val').value=(r.traffic_limit/1073741824).toFixed(2);$('mod_t_unit').value='GB'}else{$('mod_t_val').value=(r.traffic_limit/1048576).toFixed(2);$('mod_t_unit').value='MB'}}else{$('mod_t_val').value=''}
-$('ruleModal').style.display='flex'}
-function openView(id){curId=id;const r=rules.find(x=>x.id===id);$('view_n').innerText=r.name;$('view_l').innerText=r.listen;$('view_r').innerText=r.remote;
-if(r.expire_date){$('view_expire_sec').style.display='block';$('view_e_date').innerText=fmtDate(r.expire_date);$('view_e_remain').innerText=getRemain(r.expire_date)}else{$('view_expire_sec').style.display='none'}
-$('view_traffic_sec').style.display='block';$('view_t_used').innerText=fmtBytes(r.traffic_used);
-if(r.traffic_limit){$('view_t_limit').innerText=fmtBytes(r.traffic_limit);const pct=Math.min(100,(r.traffic_used/r.traffic_limit)*100);$('view_t_bar').style.width=pct+'%';$('view_t_bar').style.background=pct>90?'#ef4444':'#3b82f6'}else{$('view_t_limit').innerText='无限制';$('view_t_bar').style.width='0%'}
-$('viewModal').style.display='flex'}
-async function saveRule(){
-    let [n,l,r,e,tv,tu]=['n','l','r','e','t_val','t_unit'].map(x=>$('mod_'+x).value.trim());
-    if(!n||!l||!r) return alert('请填写必填项');
-    if(!l.includes(':'))l='0.0.0.0:'+l;
-    let ed=0; if(e) ed=new Date(e).getTime();
-    let tl=0; if(tv && parseFloat(tv)>0){ tl = parseFloat(tv) * (tu==='GB'?1073741824:1048576); }
-    const payload={name:n,listen:l,remote:r,expire_date:ed,traffic_limit:Math.floor(tl)};
-    const url = curId ? `/api/rules/${curId}` : '/api/rules';
-    const method = curId ? 'PUT' : 'POST';
-    const res = await fetch(url,{method,headers:{'Content-Type':'application/json'},body:JSON.stringify(payload)});
-    const d=await res.json();
-    if(d.status==='error') alert(d.message); else { closeModal(); load(); $('n').value='';$('l').value='';$('r').value='';}
-}
-async function resetTraffic(){if(!curId||!confirm('确定重置已用流量统计吗？'))return;await fetch(`/api/rules/${curId}/reset_traffic`,{method:'POST'});closeModal();load()}
-async function tog(id){await fetch(`/api/rules/${id}/toggle`,{method:'POST'});load()}
-async function del(id){if(confirm('确定删除此规则吗？'))await fetch(`/api/rules/${id}`,{method:'DELETE'});load()}
-function openSettings(){$('setModal').style.display='flex';switchTab(0)}
-function closeModal(){document.querySelectorAll('.modal').forEach(x=>x.style.display='none')}
-function switchTab(idx){document.querySelectorAll('.tab-btn').forEach((b,i)=>b.classList.toggle('active',i===idx));document.querySelectorAll('.tab-content').forEach((c,i)=>c.classList.toggle('active',i===idx))}
-async function saveAccount(){await fetch('/api/admin/account',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({username:$('set_u').value,password:$('set_p').value})});alert('账户已更新，请重新登录');location.reload()}
-async function saveBg(){await fetch('/api/admin/bg',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({bg_pc:$('bg_pc').value,bg_mobile:$('bg_mob').value})});location.reload()}
-async function doLogout(){await fetch('/logout',{method:'POST'});location.href='/login'}
-function openBatch(){$('batchModal').style.display='flex';$('batch_input').value='';}
-async function saveBatch(){const raw=$('batch_input').value;if(!raw.trim())return;const lines=raw.split('\n');const payload=[];for(let line of lines){line=line.trim();if(!line)continue;line=line.replace(/，/g,',');const parts=line.split(',');if(parts.length<3)continue;let [n,l,r]=[parts[0].trim(),parts[1].trim(),parts[2].trim()];if(l&&!l.includes(':'))l='0.0.0.0:'+l;if(n&&l&&r){payload.push({name:n,listen:l,remote:r,expire_date:0,traffic_limit:0});}}if(payload.length===0)return alert('格式错误');const res=await fetch('/api/rules/batch',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify(payload)});alert((await res.json()).message);$('batchModal').style.display='none';load()}
-async function delAll(){if(rules.length===0||!confirm('⚠️ 确定清空？'))return;await fetch('/api/rules/all',{method:'DELETE'});load()}
-function downloadBackup(){if(rules.length===0)return alert('无数据');window.location.href='/api/backup'}
-function openRestore(){$('restoreModal').style.display='flex'}
-async function doRestore(){try{const p=JSON.parse($('restore_input').value);if(!Array.isArray(p))throw 1;if(!confirm('确定覆盖？'))return;await fetch('/api/restore',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify(p)});location.reload()}catch(e){alert('JSON格式错误')}}
-setInterval(load, 3000);
-load();window.addEventListener('resize',render);
-</script></body></html>
-"#;
-EOF
-
-echo -e -n "${CYAN}>>> 编译面板程序 (这可能需要几分钟)...${RESET}"
-OS_ARCH=$(uname -m)
-if [[ "$OS_ARCH" == "aarch64" ]]; then
-    RUST_TRIPLE="aarch64-unknown-linux-gnu"
-else
-    RUST_TRIPLE="x86_64-unknown-linux-gnu"
-fi
-
-mkdir -p .cargo
-cat > .cargo/config.toml <<EOF
-[target.$RUST_TRIPLE]
-linker = "gcc"
-rustflags = ["-C", "link-arg=-fuse-ld=bfd"]
-EOF
-
-# 编译并检查
-cargo clean >/dev/null 2>&1
-cargo build --release > /tmp/panel_build.log 2>&1
-
-if [ $? -eq 0 ] && [ -f "target/release/realm-panel" ]; then
-    echo -e "${GREEN} [完成]${RESET}"
-    echo -e -n "${CYAN}>>> 正在部署服务...${RESET}"
-    mv target/release/realm-panel "$PANEL_BIN"
-else
-    echo -e "${RED} [失败]${RESET}"
-    echo -e "${RED}================ 错误详情 ================${RESET}"
-    cat /tmp/panel_build.log
-    echo -e "${RED}==========================================${RESET}"
-    exit 1
-fi
-
-rm -rf "$WORK_DIR"
-
-cat > /etc/systemd/system/realm-panel.service <<EOF
-[Unit]
-Description=Realm Panel (Gost V3 Backend)
-After=network.target
-
-[Service]
-User=root
-Environment="PANEL_USER=$DEFAULT_USER"
-Environment="PANEL_PASS=$DEFAULT_PASS"
-Environment="PANEL_PORT=$PANEL_PORT"
-LimitNOFILE=1048576
-LimitNPROC=1048576
-ExecStart=$PANEL_BIN
-Restart=always
-
-[Install]
-WantedBy=multi-user.target
-EOF
-
-systemctl daemon-reload
-systemctl enable realm-panel >/dev/null 2>&1
-systemctl restart realm-panel >/dev/null 2>&1
-echo -e "${GREEN} [完成]${RESET}"
-
-IP=$(curl -s4 ifconfig.me || hostname -I | awk '{print $1}')
-echo -e ""
-echo -e "${GREEN}====================================${RESET}"
-echo -e "${GREEN}      ✅ 面板 (Gost V3) 部署成功     ${RESET}"
-echo -e "${GREEN}====================================${RESET}"
-echo -e "访问地址 : ${YELLOW}http://${IP}:${PANEL_PORT}${RESET}"
-echo -e "默认用户 : ${YELLOW}${DEFAULT_USER}${RESET}"
-echo -e "默认密码 : ${YELLOW}${DEFAULT_PASS}${RESET}"
-echo -e "------------------------------------------"
+# 开始运行
+main_menu
