@@ -1,18 +1,22 @@
 #!/bin/bash
 
-# =========================================================
-#   Gost v3 面板管理脚本
-# =========================================================
+# --- 基础配置变量 ---
+PANEL_PORT="4795"
+DEFAULT_USER="admin"
+DEFAULT_PASS="123456"
 
-# --- 基础配置 ---
+# --- 路径变量 ---
 GOST_BIN="/usr/local/bin/gost"
-GOST_CONFIG="/etc/gost/config.json"
-WORK_DIR="/opt/gost_panel"
-BINARY_PATH="/usr/local/bin/gost-panel"
-DATA_FILE="/etc/gost/panel_data.json"
-LOG_FILE="/tmp/gost_install.log"
+CONFIG_FILE="/etc/gost/config.json"
+SERVICE_FILE="/etc/systemd/system/gost.service"
+TMP_DIR="/tmp/gost_install"
 
-# --- 颜色 ---
+# 面板相关路径
+WORK_DIR="/opt/gost_panel"
+PANEL_BIN="/usr/local/bin/gost-panel"
+PANEL_DATA="/etc/gost/panel_data.json"
+
+# --- 颜色定义 ---
 GREEN="\033[32m"
 RED="\033[31m"
 YELLOW="\033[33m"
@@ -20,6 +24,13 @@ CYAN="\033[36m"
 RESET="\033[0m"
 
 # --- 辅助函数 ---
+need_cmd() {
+    if ! command -v "$1" >/dev/null 2>&1; then
+        echo -e "${RED}错误: 缺少必要命令 '$1'，请先安装它。${RESET}"
+        exit 1
+    fi
+}
+
 spinner() {
     local pid=$1
     local delay=0.1
@@ -35,76 +46,214 @@ spinner() {
     printf "    \b\b\b\b"
 }
 
-print_info() { echo -e "${CYAN}>>> $1${RESET}"; }
-print_ok() { echo -e "${GREEN}✅ $1${RESET}"; }
-print_err() { echo -e "${RED}❌ $1${RESET}"; }
+run_step() {
+    echo -e -n "${CYAN}>>> $1...${RESET}"
+    eval "$2" >/dev/null 2>&1 &
+    spinner $!
+    echo -e "${GREEN} [完成]${RESET}"
+}
 
+# --- 架构检测 ---
+get_arch() {
+    case "$(uname -m)" in
+        x86_64) echo "amd64" ;;
+        aarch64) echo "arm64" ;;
+        armv7l) echo "armv7" ;;
+        *) echo "unsupported" ;;
+    esac
+}
 
-install_panel() {
-    clear
-    echo -e "${GREEN}正在安装 Gost v3 面板...${RESET}"
+prepare_env_and_fix_compilation() {
+    echo -e "${CYAN}>>> 正在优化编译环境...${RESET}"
     
-    # 1. 清理
-    print_info "清理旧环境..."
-    systemctl stop gost-panel gost >/dev/null 2>&1
-    rm -rf ~/.cargo/config ~/.cargo/config.toml /opt/gost_panel
-    rm -f "$LOG_FILE"
-
-    # 2. 依赖
-    print_info "安装系统依赖..."
+    OS_ARCH=$(uname -m)
+    
     if [ -f /etc/debian_version ]; then
         apt-get update -y >/dev/null 2>&1
-        apt-get install -y build-essential gcc g++ libssl-dev pkg-config curl wget tar >/dev/null 2>&1
+        apt-get install -y curl wget tar git build-essential pkg-config libssl-dev >/dev/null 2>&1
+        apt-get install --reinstall -y gcc gcc-10 libgcc-10-dev libgcc-s1 libc6-dev >/dev/null 2>&1
+        
+        local TRIPLET=""
+        if [[ "$OS_ARCH" == "x86_64" ]]; then
+            TRIPLET="x86_64-linux-gnu"
+            apt-get install -y gcc-multilib >/dev/null 2>&1
+        elif [[ "$OS_ARCH" == "aarch64" ]]; then
+            TRIPLET="aarch64-linux-gnu"
+        fi
+
+        if [ -n "$TRIPLET" ] && [ -d "/usr/lib/gcc/$TRIPLET/10" ]; then
+            echo "/usr/lib/gcc/$TRIPLET/10" > /etc/ld.so.conf.d/gcc.conf
+            ldconfig
+        fi
+        
     elif [ -f /etc/redhat-release ]; then
         yum groupinstall -y 'Development Tools' >/dev/null 2>&1
-        yum install -y openssl-devel gcc curl wget tar >/dev/null 2>&1
+        yum install -y curl wget tar openssl-devel libgcc glibc-static >/dev/null 2>&1
     fi
 
-    # 3. Rust
     if ! command -v cargo &> /dev/null; then
-        print_info "安装 Rust..."
-        curl --proto '=https' --tlsv1.2 -sSf https://sh.rustup.rs | sh -s -- -y >/dev/null 2>&1
+        echo -e -n "${CYAN}>>> 安装 Rust 编译器...${RESET}"
+        curl --proto '=https' --tlsv1.2 -sSf https://sh.rustup.rs | sh -s -- -y >/dev/null 2>&1 &
+        spinner $!
         source "$HOME/.cargo/env"
+        echo -e "${GREEN} [完成]${RESET}"
+    else
+        echo -e "${GREEN}>>> Rust 已安装，环境检查通过。${RESET}"
     fi
+}
 
-    # 4. Gost Bin
-    if ! command -v gost &> /dev/null; then
-        print_info "安装 Gost v3..."
-        OS_ARCH=$(uname -m)
-        if [[ "$OS_ARCH" == "x86_64" ]]; then
-            URL="https://github.com/go-gost/gost/releases/download/v3.0.0-rc10/gost_3.0.0-rc10_linux_amd64.tar.gz"
-        elif [[ "$OS_ARCH" == "aarch64" ]]; then
-            URL="https://github.com/go-gost/gost/releases/download/v3.0.0-rc10/gost_3.0.0-rc10_linux_arm64.tar.gz"
+get_gost_filename() {
+    local arch
+    arch="$(get_arch)"
+    if [ "$arch" = "unsupported" ]; then return 1; fi
+    # Gost v3 命名规则: gost_3.x.x_linux_amd64.tar.gz
+    echo "linux_${arch}.tar.gz"
+}
+
+get_local_gost_version() {
+    if [ -f "$GOST_BIN" ]; then
+        $GOST_BIN -V 2>/dev/null | awk '{print $2}'
+    else
+        echo "0.0.0"
+    fi
+}
+
+get_latest_gost_version_tag() {
+    curl -s https://api.github.com/repos/go-gost/gost/releases/latest | grep '"tag_name":' | sed -E 's/.*"([^"]+)".*/\1/' | sed 's/^v//'
+}
+
+get_latest_gost_url() {
+    local arch match_str
+    arch="$(get_arch)"
+    # 构造匹配字符串，例如 linux_amd64.tar.gz
+    match_str="linux_${arch}.tar.gz"
+    
+    curl -s https://api.github.com/repos/go-gost/gost/releases/latest \
+        | grep browser_download_url \
+        | grep "$match_str" \
+        | cut -d '"' -f 4 \
+        | head -n 1
+}
+
+ensure_config_file() {
+    if [ ! -f "$CONFIG_FILE" ]; then
+        mkdir -p "$(dirname "$CONFIG_FILE")"
+        echo '{"services":[]}' > "$CONFIG_FILE"
+    fi
+}
+
+install_gost_smart() {
+    need_cmd curl
+    need_cmd tar
+    need_cmd systemctl
+
+    echo -e "${CYAN}>>> 检查 Gost 版本...${RESET}"
+    
+    local latest_ver local_ver
+    latest_ver=$(get_latest_gost_version_tag)
+    local_ver=$(get_local_gost_version)
+
+    if [ -z "$latest_ver" ]; then
+        echo -e "${RED}无法获取最新版本号，将强制尝试安装。${RESET}"
+    elif [ "$latest_ver" == "$local_ver" ]; then
+        echo -e "${GREEN}本地 Gost 已是最新版 ($local_ver)，跳过安装。${RESET}"
+        ensure_config_file
+        if [ -f "$SERVICE_FILE" ]; then
+             return 0
         fi
-        mkdir -p /tmp/gost_tmp
-        wget -O /tmp/gost_tmp/gost.tar.gz "$URL" -q
-        tar -xvf /tmp/gost_tmp/gost.tar.gz -C /tmp/gost_tmp >/dev/null
-        mv /tmp/gost_tmp/gost "$GOST_BIN"
-        chmod +x "$GOST_BIN"
-        rm -rf /tmp/gost_tmp
+        echo -e "${YELLOW}检测到服务配置丢失，正在修复...${RESET}"
+    else
+        echo -e "${YELLOW}发现新版本: $latest_ver (当前: $local_ver)，准备更新...${RESET}"
     fi
-    mkdir -p "$(dirname "$GOST_CONFIG")"
 
-    # 5. 生成源码 
-    print_info "生成面板源码..."
-    mkdir -p "$WORK_DIR/src" "$WORK_DIR/.cargo"
+    local url
+    url="$(get_latest_gost_url || true)"
 
-    # 修复链接器
-    cat > "$WORK_DIR/.cargo/config.toml" <<EOF
-[target.x86_64-unknown-linux-gnu]
-linker = "gcc"
-[target.aarch64-unknown-linux-gnu]
-linker = "gcc"
+    if [ -z "$url" ]; then
+        echo -e "${RED}获取下载链接失败。${RESET}"
+        exit 1
+    fi
+
+    echo -e "${GREEN}下载地址：$url${RESET}"
+    mkdir -p "$TMP_DIR"
+    cd "$TMP_DIR" || exit 1
+    rm -f gost.tar.gz gost
+
+    if ! curl -L -o gost.tar.gz "$url"; then
+        echo -e "${RED}下载失败。${RESET}"
+        exit 1
+    fi
+    
+    tar -xzf gost.tar.gz
+    # 解压后通常直接就是 gost 二进制文件
+    if [ ! -f "gost" ]; then
+        echo -e "${RED}解压失败，未找到二进制文件。${RESET}"
+        exit 1
+    fi
+
+    systemctl stop gost >/dev/null 2>&1
+    mv gost "$GOST_BIN"
+    chmod +x "$GOST_BIN"
+
+    # Gost v3 使用 -C 指定配置文件
+    cat > "$SERVICE_FILE" <<EOF
+[Unit]
+Description=Gost Proxy Service
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+ExecStart=$GOST_BIN -C $CONFIG_FILE
+Restart=always
+LimitNOFILE=1048576
+LimitNPROC=1048576
+
+[Install]
+WantedBy=multi-user.target
 EOF
 
-    cd "$WORK_DIR"
-    
-    # 依赖配置 (不包含 sysinfo)
-    cat > Cargo.toml <<EOF
+    ensure_config_file
+    systemctl daemon-reload
+    systemctl enable gost >/dev/null 2>&1 || true
+    systemctl restart gost
+    echo -e "${GREEN}Gost 安装/更新完成。${RESET}"
+    cd ~
+    rm -rf "$TMP_DIR"
+}
+
+# --- 主流程 ---
+
+if [ "$EUID" -ne 0 ]; then
+    echo -e "${RED}请以 root 用户运行！${RESET}"
+    exit 1
+fi
+
+clear
+echo -e "${GREEN}==========================================${RESET}"
+echo -e "${GREEN}            Gost 面板一键部署            ${RESET}"
+echo -e "${GREEN}==========================================${RESET}"
+
+# 1. 准备环境
+prepare_env_and_fix_compilation
+
+# 2. 智能安装 Gost
+install_gost_smart
+
+# 3. 生成面板代码
+mkdir -p "$(dirname "$PANEL_DATA")"
+run_step "生成面板源代码" "
+rm -rf '$WORK_DIR'
+mkdir -p '$WORK_DIR/src'
+"
+cd "$WORK_DIR"
+
+# 注意：移除了 toml 依赖，因为 Gost v3 我们使用 JSON 配置
+cat > Cargo.toml <<EOF
 [package]
 name = "gost-panel"
 version = "1.0.0"
 edition = "2021"
+
 [dependencies]
 axum = { version = "0.7", features = ["macros"] }
 tokio = { version = "1", features = ["full"] }
@@ -115,213 +264,446 @@ anyhow = "1.0"
 uuid = { version = "1", features = ["v4"] }
 EOF
 
-    # 写入 Rust 逻辑代码
-    cat > src/main.rs << 'EOF'
-use axum::{extract::{State,Path},http::StatusCode,response::{Html,IntoResponse,Response},routing::{get,post,put,delete},Json,Router,Form};
-use serde::{Deserialize,Serialize};
-use std::{fs,process::Command,sync::{Arc,Mutex}};
-use tower_cookies::{Cookie,Cookies,CookieManagerLayer};
-const GOST_CONFIG:&str="/etc/gost/config.json";const DATA_FILE:&str="/etc/gost/panel_data.json";
-#[derive(Serialize,Deserialize,Clone,Debug)] struct Rule{id:String,name:String,listen:String,remote:String,protocol:String,enabled:bool}
-#[derive(Serialize,Deserialize,Clone,Debug)] struct AdminConfig{username:String,pass_hash:String,bg_pc:String}
-#[derive(Serialize,Deserialize,Clone,Debug)] struct AppData{admin:AdminConfig,rules:Vec<Rule>}
-#[derive(Serialize)] struct GConf{services:Vec<GSvc>,chains:Vec<GChn>}
-#[derive(Serialize)] struct GSvc{name:String,addr:String,handler:GHdl,listener:GLsn}
-#[derive(Serialize)] struct GHdl{#[serde(rename="type")] t:String,chain:String}
-#[derive(Serialize)] struct GLsn{#[serde(rename="type")] t:String}
-#[derive(Serialize)] struct GChn{name:String,hops:Vec<GHop>}
-#[derive(Serialize)] struct GHop{name:String,addr:String}
-struct AppState{data:Mutex<AppData>}
-#[tokio::main] async fn main(){
- let init=load_data();
- let st=Arc::new(AppState{data:Mutex::new(init)});
- let app=Router::new().route("/",get(idx)).route("/login",get(pg_login).post(act_login)).route("/api/rules",get(get_r).post(add_r)).route("/api/rules/batch",post(bat_r)).route("/api/rules/:id",put(upd_r).delete(del_r)).route("/api/rules/:id/toggle",post(tog_r)).route("/logout",post(act_logout)).layer(CookieManagerLayer::new()).with_state(st);
- let p=std::env::var("PANEL_PORT").unwrap_or("9794".to_string());
- let l=tokio::net::TcpListener::bind(format!("0.0.0.0:{}",p)).await.unwrap();
- axum::serve(l,app).await.unwrap();
+# --- Rust 源码 (适配 Gost Config) ---
+cat > src/main.rs << 'EOF'
+use axum::{
+    extract::{State, Path},
+    http::StatusCode,
+    response::{Html, IntoResponse, Response},
+    routing::{get, post, put, delete},
+    Json, Router, Form,
+};
+use serde::{Deserialize, Serialize};
+use std::{fs, process::Command, sync::{Arc, Mutex}, path::Path as FilePath};
+use tower_cookies::{Cookie, Cookies, CookieManagerLayer};
+
+const CONFIG_FILE: &str = "/etc/gost/config.json";
+const DATA_FILE: &str = "/etc/gost/panel_data.json";
+
+#[derive(Serialize, Deserialize, Clone, Debug)]
+struct Rule {
+    id: String,
+    name: String,
+    listen: String,
+    remote: String,
+    enabled: bool,
 }
-fn load_data()->AppData{if let Ok(c)=fs::read_to_string(DATA_FILE){if let Ok(d)=serde_json::from_str::<AppData>(&c){save_gost(&d);return d;}}let d=AppData{admin:AdminConfig{username:"admin".into(),pass_hash:"123456".into(),bg_pc:"https://img.inim.im/file/1769439286929_61891168f564c650f6fb03d1962e5f37.jpeg".into()},rules:vec![]};save_json(&d);save_gost(&d);d}
-fn save_json(d:&AppData){let _=fs::write(DATA_FILE,serde_json::to_string_pretty(d).unwrap());}
-fn save_gost(d:&AppData){let(mut svcs,mut chns)=(vec![],vec![]);for r in d.rules.iter().filter(|r|r.enabled){let cn=format!("c-{}",r.id);chns.push(GChn{name:cn.clone(),hops:vec![GHop{name:format!("h-{}",r.id),addr:r.remote.clone()}]});let t=if r.protocol=="udp"{"udp"}else{"tcp"};svcs.push(GSvc{name:format!("s-{}",r.id),addr:r.listen.clone(),handler:GHdl{t:t.into(),chain:cn},listener:GLsn{t:t.into()}});}let _=fs::write(GOST_CONFIG,serde_json::to_string_pretty(&GConf{services:svcs,chains:chns}).unwrap());let _=Command::new("systemctl").arg("restart").arg("gost").status();}
-fn chk(c:&Cookies,s:&AppData)->bool{if let Some(v)=c.get("auth_session"){v.value()==s.admin.pass_hash}else{false}}
-async fn idx(c:Cookies,State(s):State<Arc<AppState>>)->Response{let d=s.data.lock().unwrap();if!chk(&c,&d){return axum::response::Redirect::to("/login").into_response()}Html(D_HTM.replace("{U}",&d.admin.username)).into_response()}
-async fn pg_login(State(s):State<Arc<AppState>>)->Response{Html(L_HTM.replace("{B}",&s.data.lock().unwrap().admin.bg_pc)).into_response()}
-#[derive(Deserialize)]struct L{username:String,password:String}
-async fn act_login(c:Cookies,State(s):State<Arc<AppState>>,Form(f):Form<L>)->Response{let d=s.data.lock().unwrap();if f.username==d.admin.username&&f.password==d.admin.pass_hash{let mut k=Cookie::new("auth_session",d.admin.pass_hash.clone());k.set_path("/");c.add(k);axum::response::Redirect::to("/").into_response()}else{StatusCode::UNAUTHORIZED.into_response()}}
-async fn act_logout(c:Cookies)->Response{let mut k=Cookie::new("auth_session","");k.set_path("/");c.remove(k);Json("ok").into_response()}
-async fn get_r(c:Cookies,State(s):State<Arc<AppState>>)->Response{let d=s.data.lock().unwrap();if!chk(&c,&d){return StatusCode::UNAUTHORIZED.into_response()}Json(d.clone()).into_response()}
-#[derive(Deserialize)]struct R{name:String,listen:String,remote:String,protocol:Option<String>}
-async fn add_r(c:Cookies,State(s):State<Arc<AppState>>,Json(q):Json<R>)->Response{let mut d=s.data.lock().unwrap();if!chk(&c,&d){return StatusCode::UNAUTHORIZED.into_response()}d.rules.push(Rule{id:uuid::Uuid::new_v4().to_string(),name:q.name,listen:q.listen,remote:q.remote,protocol:q.protocol.unwrap_or("tcp".into()),enabled:true});save_json(&d);save_gost(&d);Json("ok").into_response()}
-async fn bat_r(c:Cookies,State(s):State<Arc<AppState>>,Json(qs):Json<Vec<R>>)->Response{let mut d=s.data.lock().unwrap();if!chk(&c,&d){return StatusCode::UNAUTHORIZED.into_response()}for q in qs{d.rules.push(Rule{id:uuid::Uuid::new_v4().to_string(),name:q.name,listen:q.listen,remote:q.remote,protocol:q.protocol.unwrap_or("tcp".into()),enabled:true});}save_json(&d);save_gost(&d);Json("ok").into_response()}
-async fn upd_r(c:Cookies,State(s):State<Arc<AppState>>,Path(i):Path<String>,Json(q):Json<R>)->Response{let mut d=s.data.lock().unwrap();if!chk(&c,&d){return StatusCode::UNAUTHORIZED.into_response()}if let Some(r)=d.rules.iter_mut().find(|x|x.id==i){r.name=q.name;r.listen=q.listen;r.remote=q.remote;r.protocol=q.protocol.unwrap_or("tcp".into());save_json(&d);save_gost(&d);}Json("ok").into_response()}
-async fn del_r(c:Cookies,State(s):State<Arc<AppState>>,Path(i):Path<String>)->Response{let mut d=s.data.lock().unwrap();if!chk(&c,&d){return StatusCode::UNAUTHORIZED.into_response()}d.rules.retain(|x|x.id!=i);save_json(&d);save_gost(&d);Json("ok").into_response()}
-async fn tog_r(c:Cookies,State(s):State<Arc<AppState>>,Path(i):Path<String>)->Response{let mut d=s.data.lock().unwrap();if!chk(&c,&d){return StatusCode::UNAUTHORIZED.into_response()}if let Some(r)=d.rules.iter_mut().find(|x|x.id==i){r.enabled=!r.enabled;save_json(&d);save_gost(&d);}Json("ok").into_response()}
-const L_HTM:&str=r#"<!DOCTYPE html><html><head><meta charset="utf-8"><meta name="viewport" content="width=device-width,initial-scale=1"><title>Login</title><style>body{margin:0;height:100vh;display:flex;justify-content:center;align-items:center;background:url('{B}') center/cover;font-family:system-ui}.b{background:rgba(255,255,255,0.9);padding:2rem;border-radius:12px;width:300px}input{width:100%;padding:10px;margin:8px 0;box-sizing:border-box}button{width:100%;padding:10px;background:#2563eb;color:#fff;border:none;cursor:pointer}</style></head><body><div class="b"><h3 style="text-align:center">Gost Panel</h3><form onsubmit="L(event)"><input id="u"><input id="p" type="password"><button>Login</button></form></div><script>async function L(e){e.preventDefault();await fetch('/login',{method:'POST',headers:{'Content-Type':'application/x-www-form-urlencoded'},body:`username=${document.getElementById('u').value}&password=${document.getElementById('p').value}`}).then(r=>{if(r.redirected)location.href='/';else alert('Fail')})}</script></body></html>"#;
+
+#[derive(Serialize, Deserialize, Clone, Debug)]
+struct AdminConfig {
+    username: String,
+    pass_hash: String,
+    #[serde(default = "default_bg_pc")]
+    bg_pc: String,
+    #[serde(default = "default_bg_mobile")]
+    bg_mobile: String,
+}
+fn default_bg_pc() -> String { "https://img.inim.im/file/1769439286929_61891168f564c650f6fb03d1962e5f37.jpeg".to_string() }
+fn default_bg_mobile() -> String { "https://img.inim.im/file/1764296937373_bg_m_2.png".to_string() }
+
+#[derive(Serialize, Deserialize, Clone, Debug)]
+struct AppData {
+    admin: AdminConfig,
+    rules: Vec<Rule>,
+}
+
+// --- Gost v3 Config Structures ---
+#[derive(Serialize)]
+struct GostNode {
+    addr: String,
+}
+#[derive(Serialize)]
+struct GostForwarder {
+    nodes: Vec<GostNode>,
+}
+#[derive(Serialize)]
+struct GostHandler {
+    #[serde(rename = "type")]
+    handler_type: String,
+}
+#[derive(Serialize)]
+struct GostService {
+    name: String,
+    addr: String,
+    handler: GostHandler,
+    forwarder: GostForwarder,
+}
+#[derive(Serialize)]
+struct GostConfig {
+    services: Vec<GostService>,
+}
+
+struct AppState {
+    data: Mutex<AppData>,
+}
+
+#[tokio::main]
+async fn main() {
+    let initial_data = load_or_init_data();
+    let state = Arc::new(AppState {
+        data: Mutex::new(initial_data),
+    });
+
+    let app = Router::new()
+        .route("/", get(index_page))
+        .route("/login", get(login_page).post(login_action))
+        .route("/api/rules", get(get_rules).post(add_rule))
+        .route("/api/rules/batch", post(batch_add_rules))
+        .route("/api/rules/all", delete(delete_all_rules)) 
+        .route("/api/rules/:id", put(update_rule).delete(delete_rule))
+        .route("/api/rules/:id/toggle", post(toggle_rule))
+        .route("/api/admin/account", post(update_account))
+        .route("/api/admin/bg", post(update_bg))
+        .route("/api/backup", get(download_backup))
+        .route("/api/restore", post(restore_backup))
+        .route("/logout", post(logout_action))
+        .layer(CookieManagerLayer::new())
+        .with_state(state);
+
+    let port = std::env::var("PANEL_PORT").unwrap_or_else(|_| "4794".to_string());
+    let listener = tokio::net::TcpListener::bind(format!("0.0.0.0:{}", port)).await.unwrap();
+    axum::serve(listener, app).await.unwrap();
+}
+
+fn load_or_init_data() -> AppData {
+    if let Ok(content) = fs::read_to_string(DATA_FILE) {
+        if let Ok(mut data) = serde_json::from_str::<AppData>(&content) {
+            // Re-generate config to ensure sync
+            save_config_gost(&data); 
+            return data;
+        }
+    }
+    
+    let admin = AdminConfig {
+        username: std::env::var("PANEL_USER").unwrap_or("admin".to_string()),
+        pass_hash: std::env::var("PANEL_PASS").unwrap_or("123456".to_string()),
+        bg_pc: default_bg_pc(),
+        bg_mobile: default_bg_mobile(),
+    };
+    // Default empty rules if no data file found
+    let rules = Vec::new();
+    let data = AppData { admin, rules };
+    save_config_gost(&data); 
+    save_json(&data);
+    data
+}
+
+fn save_json(data: &AppData) {
+    let json_str = serde_json::to_string_pretty(data).unwrap();
+    let _ = fs::write(DATA_FILE, json_str);
+}
+
+fn save_config_gost(data: &AppData) {
+    let mut services = Vec::new();
+
+    for rule in data.rules.iter().filter(|r| r.enabled) {
+        // Ensure listen addr has port
+        let listen_port = rule.listen.split(':').last().unwrap_or("").trim();
+        if listen_port.is_empty() { continue; }
+        
+        // 1. TCP Service
+        services.push(GostService {
+            name: format!("{}_tcp", rule.name),
+            addr: format!("tcp://:{}", listen_port), // Explicit TCP
+            handler: GostHandler { handler_type: "tcp".to_string() },
+            forwarder: GostForwarder {
+                nodes: vec![GostNode { addr: rule.remote.clone() }]
+            }
+        });
+
+        // 2. UDP Service (Gost v3 needs separate service or specific listener config)
+        services.push(GostService {
+            name: format!("{}_udp", rule.name),
+            addr: format!("udp://:{}", listen_port), // Explicit UDP
+            handler: GostHandler { handler_type: "udp".to_string() },
+            forwarder: GostForwarder {
+                nodes: vec![GostNode { addr: rule.remote.clone() }]
+            }
+        });
+    }
+
+    let config = GostConfig { services };
+    let json_str = serde_json::to_string_pretty(&config).unwrap();
+    let _ = fs::write(CONFIG_FILE, json_str);
+    
+    // Restart Gost Service
+    let _ = Command::new("systemctl").arg("restart").arg("gost").status();
+}
+
+fn check_auth(cookies: &Cookies, state: &AppData) -> bool {
+    if let Some(cookie) = cookies.get("auth_session") {
+        return cookie.value() == state.admin.pass_hash;
+    }
+    false
+}
+
+async fn index_page(cookies: Cookies, State(state): State<Arc<AppState>>) -> Response {
+    let data = state.data.lock().unwrap();
+    if !check_auth(&cookies, &data) { return axum::response::Redirect::to("/login").into_response(); }
+    let html = DASHBOARD_HTML
+        .replace("{{USER}}", &data.admin.username)
+        .replace("{{BG_PC}}", &data.admin.bg_pc)
+        .replace("{{BG_MOBILE}}", &data.admin.bg_mobile);
+    Html(html).into_response()
+}
+
+async fn login_page(State(state): State<Arc<AppState>>) -> Response {
+    let data = state.data.lock().unwrap();
+    let html = LOGIN_HTML
+        .replace("{{BG_PC}}", &data.admin.bg_pc)
+        .replace("{{BG_MOBILE}}", &data.admin.bg_mobile);
+    Html(html).into_response()
+}
+
+#[derive(Deserialize)] struct LoginParams { username: String, password: String }
+async fn login_action(cookies: Cookies, State(state): State<Arc<AppState>>, Form(form): Form<LoginParams>) -> Response {
+    let data = state.data.lock().unwrap();
+    if form.username == data.admin.username && form.password == data.admin.pass_hash {
+        let mut cookie = Cookie::new("auth_session", data.admin.pass_hash.clone());
+        cookie.set_path("/"); cookie.set_http_only(true); 
+        cookie.set_same_site(tower_cookies::cookie::SameSite::Strict);
+        cookies.add(cookie);
+        axum::response::Redirect::to("/").into_response()
+    } else {
+        StatusCode::UNAUTHORIZED.into_response()
+    }
+}
+async fn logout_action(cookies: Cookies) -> Response {
+    let mut cookie = Cookie::new("auth_session", "");
+    cookie.set_path("/");
+    cookies.remove(cookie);
+    Json(serde_json::json!({"status":"ok"})).into_response()
+}
+
+async fn get_rules(cookies: Cookies, State(state): State<Arc<AppState>>) -> Response {
+    let data = state.data.lock().unwrap();
+    if !check_auth(&cookies, &data) { return StatusCode::UNAUTHORIZED.into_response(); }
+    Json(data.clone()).into_response()
+}
+
+#[derive(Deserialize)] struct AddRuleReq { name: String, listen: String, remote: String }
+async fn add_rule(cookies: Cookies, State(state): State<Arc<AppState>>, Json(req): Json<AddRuleReq>) -> Response {
+    let mut data = state.data.lock().unwrap();
+    if !check_auth(&cookies, &data) { return StatusCode::UNAUTHORIZED.into_response(); }
+
+    if req.name.trim().is_empty() || req.listen.trim().is_empty() || req.remote.trim().is_empty() {
+        return Json(serde_json::json!({"status":"error", "message": "所有字段都不能为空！"})).into_response();
+    }
+
+    let new_port = req.listen.split(':').last().unwrap_or("").trim();
+    if data.rules.iter().any(|r| r.listen.split(':').last().unwrap_or("").trim() == new_port) {
+        return Json(serde_json::json!({"status":"error", "message": "端口已被占用！"})).into_response();
+    }
+    data.rules.push(Rule { id: uuid::Uuid::new_v4().to_string(), name: req.name, listen: req.listen, remote: req.remote, enabled: true });
+    save_json(&data); save_config_gost(&data);
+    Json(serde_json::json!({"status":"ok"})).into_response()
+}
+
+async fn batch_add_rules(cookies: Cookies, State(state): State<Arc<AppState>>, Json(reqs): Json<Vec<AddRuleReq>>) -> Response {
+    let mut data = state.data.lock().unwrap();
+    if !check_auth(&cookies, &data) { return StatusCode::UNAUTHORIZED.into_response(); }
+    let mut added_count = 0;
+    for req in reqs {
+        let new_port = req.listen.split(':').last().unwrap_or("").trim();
+        if new_port.is_empty() { continue; }
+        if data.rules.iter().any(|r| r.listen.split(':').last().unwrap_or("").trim() == new_port) { continue; }
+        data.rules.push(Rule { id: uuid::Uuid::new_v4().to_string(), name: req.name, listen: req.listen, remote: req.remote, enabled: true });
+        added_count += 1;
+    }
+    if added_count > 0 { save_json(&data); save_config_gost(&data); }
+    Json(serde_json::json!({"status":"ok", "message": format!("成功添加 {} 条规则", added_count)})).into_response()
+}
+
+async fn delete_all_rules(cookies: Cookies, State(state): State<Arc<AppState>>) -> Response {
+    let mut data = state.data.lock().unwrap();
+    if !check_auth(&cookies, &data) { return StatusCode::UNAUTHORIZED.into_response(); }
+    data.rules.clear();
+    save_json(&data); 
+    save_config_gost(&data); 
+    Json(serde_json::json!({"status":"ok", "message": "所有规则已清空"})).into_response()
+}
+
+async fn download_backup(cookies: Cookies, State(state): State<Arc<AppState>>) -> Response {
+    let data = state.data.lock().unwrap();
+    if !check_auth(&cookies, &data) { return StatusCode::UNAUTHORIZED.into_response(); }
+    if data.rules.is_empty() {
+         return Json(serde_json::json!({"status":"error", "message": "当前没有规则，无法导出"})).into_response();
+    }
+    let json_str = serde_json::to_string_pretty(&data.rules).unwrap();
+    Response::builder()
+        .header("Content-Type", "application/json")
+        .header("Content-Disposition", "attachment; filename=\"gost_backup.json\"")
+        .body(axum::body::Body::from(json_str))
+        .unwrap()
+}
+
+async fn restore_backup(cookies: Cookies, State(state): State<Arc<AppState>>, Json(backup_rules): Json<Vec<Rule>>) -> Response {
+    let mut data = state.data.lock().unwrap();
+    if !check_auth(&cookies, &data) { return StatusCode::UNAUTHORIZED.into_response(); }
+    if backup_rules.is_empty() { return Json(serde_json::json!({"status": "error", "message": "导入的数据为空"})).into_response(); }
+    
+    data.rules = backup_rules;
+    save_json(&data); save_config_gost(&data);
+    Json(serde_json::json!({"status":"ok", "message": format!("成功恢复 {} 条规则", data.rules.len())})).into_response()
+}
+
+async fn toggle_rule(cookies: Cookies, State(state): State<Arc<AppState>>, Path(id): Path<String>) -> Response {
+    let mut data = state.data.lock().unwrap();
+    if !check_auth(&cookies, &data) { return StatusCode::UNAUTHORIZED.into_response(); }
+    if let Some(rule) = data.rules.iter_mut().find(|r| r.id == id) { rule.enabled = !rule.enabled; save_json(&data); save_config_gost(&data); }
+    Json(serde_json::json!({"status":"ok"})).into_response()
+}
+async fn delete_rule(cookies: Cookies, State(state): State<Arc<AppState>>, Path(id): Path<String>) -> Response {
+    let mut data = state.data.lock().unwrap();
+    if !check_auth(&cookies, &data) { return StatusCode::UNAUTHORIZED.into_response(); }
+    data.rules.retain(|r| r.id != id); save_json(&data); save_config_gost(&data);
+    Json(serde_json::json!({"status":"ok"})).into_response()
+}
+#[derive(Deserialize)] struct UpdateRuleReq { name: String, listen: String, remote: String }
+async fn update_rule(cookies: Cookies, State(state): State<Arc<AppState>>, Path(id): Path<String>, Json(req): Json<UpdateRuleReq>) -> Response {
+    let mut data = state.data.lock().unwrap();
+    if !check_auth(&cookies, &data) { return StatusCode::UNAUTHORIZED.into_response(); }
+    let new_port = req.listen.split(':').last().unwrap_or("").trim();
+    if data.rules.iter().any(|r| r.id != id && r.listen.split(':').last().unwrap_or("").trim() == new_port) {
+        return Json(serde_json::json!({"status":"error", "message": "端口已被占用！"})).into_response();
+    }
+    if let Some(rule) = data.rules.iter_mut().find(|r| r.id == id) { rule.name = req.name; rule.listen = req.listen; rule.remote = req.remote; save_json(&data); save_config_gost(&data); }
+    Json(serde_json::json!({"status":"ok"})).into_response()
+}
+#[derive(Deserialize)] struct AccountUpdate { username: String, password: String }
+async fn update_account(cookies: Cookies, State(state): State<Arc<AppState>>, Json(req): Json<AccountUpdate>) -> Response {
+    let mut data = state.data.lock().unwrap();
+    if !check_auth(&cookies, &data) { return StatusCode::UNAUTHORIZED.into_response(); }
+    data.admin.username = req.username;
+    if !req.password.is_empty() { data.admin.pass_hash = req.password; }
+    let mut cookie = Cookie::new("auth_session", data.admin.pass_hash.clone());
+    cookie.set_path("/"); cookie.set_http_only(true); cookies.add(cookie); save_json(&data);
+    Json(serde_json::json!({"status":"ok"})).into_response()
+}
+#[derive(Deserialize)] struct BgUpdate { bg_pc: String, bg_mobile: String }
+async fn update_bg(cookies: Cookies, State(state): State<Arc<AppState>>, Json(req): Json<BgUpdate>) -> Response {
+    let mut data = state.data.lock().unwrap();
+    if !check_auth(&cookies, &data) { return StatusCode::UNAUTHORIZED.into_response(); }
+    data.admin.bg_pc = req.bg_pc; data.admin.bg_mobile = req.bg_mobile; save_json(&data);
+    Json(serde_json::json!({"status":"ok"})).into_response()
+}
+
+const LOGIN_HTML: &str = r#"
+<!DOCTYPE html><html><head><meta charset="utf-8"><meta name="viewport" content="width=device-width, initial-scale=1, maximum-scale=1, user-scalable=no"><title>Gost Login</title><style>*{margin:0;padding:0;box-sizing:border-box}body{height:100vh;width:100vw;overflow:hidden;display:flex;justify-content:center;align-items:center;font-family:-apple-system,BlinkMacSystemFont,"Segoe UI",Roboto,sans-serif;background:url('{{BG_PC}}') no-repeat center center/cover;color:#374151}@media(max-width:768px){body{background-image:url('{{BG_MOBILE}}')}}.overlay{position:absolute;top:0;left:0;width:100%;height:100%;background:rgba(0,0,0,0.05)}.box{position:relative;z-index:2;background:rgba(255,255,255,0.3);backdrop-filter:blur(25px);-webkit-backdrop-filter:blur(25px);padding:2.5rem;border-radius:24px;border:1px solid rgba(255,255,255,0.4);box-shadow:0 8px 32px rgba(0,0,0,0.05);width:90%;max-width:380px;text-align:center}h2{margin-bottom:2rem;color:#374151;font-weight:600;letter-spacing:1px}input{width:100%;padding:14px;margin-bottom:1.2rem;border:1px solid rgba(255,255,255,0.5);border-radius:12px;outline:none;background:rgba(255,255,255,0.5);transition:0.3s;color:#374151}input:focus{background:rgba(255,255,255,0.9);border-color:#3b82f6}button{width:100%;padding:14px;background:rgba(59,130,246,0.85);color:white;border:none;border-radius:12px;cursor:pointer;font-weight:600;font-size:1rem;transition:0.3s;backdrop-filter:blur(5px)}button:hover{background:#2563eb;transform:translateY(-1px)}</style></head><body><div class="overlay"></div><div class="box"><h2>Gost Panel</h2><form onsubmit="doLogin(event)"><input type="text" id="u" placeholder="Username" required><input type="password" id="p" placeholder="Password" required><button type="submit" id="btn">登 录</button></form></div><script>async function doLogin(e){e.preventDefault();const b=document.getElementById('btn');b.innerText='登录中...';b.disabled=true;const res=await fetch('/login',{method:'POST',headers:{'Content-Type':'application/x-www-form-urlencoded'},body:`username=${encodeURIComponent(document.getElementById('u').value)}&password=${encodeURIComponent(document.getElementById('p').value)}`});if(res.redirected){location.href=res.url}else if(res.ok){location.href='/'}else{alert('用户名或密码错误');b.innerText='登 录';b.disabled=false}}</script></body></html>
+"#;
+
+const DASHBOARD_HTML: &str = r#"
+<!DOCTYPE html><html><head><meta charset="utf-8"><meta name="viewport" content="width=device-width, initial-scale=1, maximum-scale=1, user-scalable=no, viewport-fit=cover"><title>Gost Panel</title><link href="https://cdnjs.cloudflare.com/ajax/libs/font-awesome/6.0.0/css/all.min.css" rel="stylesheet"><style>:root{--primary:#3b82f6;--danger:#f87171;--success:#34d399;--text-main:#374151}::-webkit-scrollbar{width:5px;height:5px}::-webkit-scrollbar-thumb{background:rgba(0,0,0,0.1);border-radius:10px}*{box-sizing:border-box}body{font-family:-apple-system,BlinkMacSystemFont,"Segoe UI",Roboto,sans-serif;margin:0;padding:0;height:100vh;height:100dvh;overflow:hidden;background:url('{{BG_PC}}') no-repeat center center/cover;display:flex;flex-direction:column;color:var(--text-main)}@media(max-width:768px){body{background-image:url('{{BG_MOBILE}}')}}.navbar{flex:0 0 auto;background:rgba(255,255,255,0.3);backdrop-filter:blur(25px);-webkit-backdrop-filter:blur(25px);border-bottom:1px solid rgba(255,255,255,0.3);padding:0.8rem 2rem;display:flex;justify-content:space-between;align-items:center;z-index:10}.brand{font-weight:700;font-size:1.1rem;color:var(--text-main);display:flex;align-items:center;gap:10px}.container{flex:1;display:flex;flex-direction:column;max-width:1100px;margin:1.5rem auto;width:95%;overflow:hidden}.card-fixed{background:rgba(255,255,255,0.3);backdrop-filter:blur(20px);border:1px solid rgba(255,255,255,0.4);border-radius:18px;padding:1.2rem;margin-bottom:1.5rem;box-shadow:0 4px 15px rgba(0,0,0,0.03)}.card-scroll{flex:1;background:rgba(255,255,255,0.25);backdrop-filter:blur(20px);border:1px solid rgba(255,255,255,0.4);border-radius:18px;display:flex;flex-direction:column;overflow:hidden;box-shadow:0 4px 15px rgba(0,0,0,0.03)}.table-wrapper{flex:1;overflow-y:auto;padding:0 1.5rem 1.5rem}table{width:100%;border-collapse:separate;border-spacing:0 10px}
+thead th{position:sticky;top:0;background:rgba(255,255,255,0.4);backdrop-filter:blur(15px);z-index:5;padding:14px 12px;text-align:left;font-size:0.85rem;text-transform:uppercase;letter-spacing:1px;color:#6b7280;border-top:1px solid rgba(255,255,255,0.3);border-bottom:1px solid rgba(255,255,255,0.3)}
+thead th:first-child{border-top-left-radius:15px;border-bottom-left-radius:15px;border-left:1px solid rgba(255,255,255,0.3)}
+thead th:last-child{border-top-right-radius:15px;border-bottom-right-radius:15px;border-right:1px solid rgba(255,255,255,0.3)}
+tbody tr{background:transparent;transition:0.3s}
+@media(min-width:768px){tbody tr:hover td{background:rgba(255,255,255,0.7);transform:translateY(-1px);box-shadow:0 4px 10px rgba(0,0,0,0.02)}}
+td{background:rgba(255,255,255,0.4);padding:14px 12px;font-size:0.92rem;font-weight:500;color:var(--text-main);border-top:1px solid rgba(255,255,255,0.3);border-bottom:1px solid rgba(255,255,255,0.3)}
+td:first-child{border-left:1px solid rgba(255,255,255,0.3);border-top-left-radius:15px;border-bottom-left-radius:15px}
+td:last-child{border-right:1px solid rgba(255,255,255,0.3);border-top-right-radius:15px;border-bottom-right-radius:15px}
+.btn{padding:8px 12px;border-radius:10px;border:none;cursor:pointer;color:white;transition:0.2s;display:inline-flex;align-items:center;justify-content:center;gap:6px;font-weight:500}.btn-primary{background:var(--primary);opacity:0.9}.btn-danger{background:var(--danger);opacity:0.9}.btn-gray{background:rgba(0,0,0,0.05);color:var(--text-main)}.grid-input{display:grid;grid-template-columns:1.5fr 1fr 2fr auto auto;gap:12px}
+.tools-group { display: flex; gap: 5px; } 
+input{padding:10px 14px;border:1px solid rgba(0,0,0,0.05);background:rgba(255,255,255,0.5);border-radius:10px;outline:none;transition:0.3s;color:var(--text-main);font-weight:500}input:focus{border-color:var(--primary);background:white}.status-dot{height:7px;width:7px;border-radius:50%;display:inline-block;margin-right:8px}.bg-green{background:var(--success);box-shadow:0 0 8px var(--success)}.bg-gray{background:#9ca3af}.modal{display:none;position:fixed;top:0;left:0;width:100%;height:100%;background:rgba(0,0,0,0.1);z-index:100;justify-content:center;align-items:center;backdrop-filter:blur(8px)}.modal-box{background:rgba(255,255,255,0.9);width:90%;max-width:420px;padding:2rem;border-radius:20px;box-shadow:0 20px 40px rgba(0,0,0,0.1);animation:pop 0.3s ease}@keyframes pop{from{transform:scale(0.9);opacity:0}to{transform:scale(1);opacity:1}}.tab-header{display:flex;gap:20px;margin-bottom:20px;border-bottom:1px solid rgba(0,0,0,0.05)}.tab-btn{padding:10px 5px;cursor:pointer;font-size:0.9rem;color:#9ca3af}.tab-btn.active{color:var(--primary);border-bottom:2px solid var(--primary);font-weight:600}.tab-content{display:none}.tab-content.active{display:block}label{display:block;margin:12px 0 6px;font-size:0.85rem;color:#6b7280}
+@media(max-width:768px){.grid-input{grid-template-columns:1fr; gap:10px}.navbar{padding:0.8rem 1rem}.nav-text{display:none}thead{display:none}tbody tr{display:flex;flex-direction:column;border-radius:18px!important;margin-bottom:12px;padding:15px;border:1px solid rgba(255,255,255,0.3);background:rgba(255,255,255,0.4)}td{padding:6px 0;display:flex;justify-content:space-between;border-radius:0!important;align-items:center;border:none;background:transparent}td::before{content:attr(data-label);color:#9ca3af;font-size:0.85rem}td[data-label="操作"]{justify-content:flex-end;gap:10px;margin-top:8px;padding-top:10px;border-top:1px solid rgba(0,0,0,0.05)}td[data-label="操作"] .btn{flex:none;width:auto;padding:6px 14px;border-radius:8px;font-size:0.85rem}td[data-label="操作"] .btn-gray{background:transparent;border:1px solid rgba(0,0,0,0.15);color:#555}td[data-label="操作"] .btn-primary{background:var(--primary);color:white}td[data-label="操作"] .btn-danger{background:rgba(239,68,68,0.1);color:var(--danger);border:1px solid rgba(239,68,68,0.2)}
+.tools-group { width: 100%; margin-top: 5px; }
+.tools-group .btn { flex: 1; justify-content: center; padding: 10px 0; font-size: 0.85rem; }
+}</style></head><body><div class="navbar"><div class="brand"><i class="fas fa-network-wired"></i> <span class="nav-text">Gost 转发面板</span></div><div class="nav-actions" style="display:flex;gap:15px"><button class="btn btn-gray" onclick="openSettings()"><i class="fas fa-sliders-h"></i> <span class="nav-text">面板设置</span></button><button class="btn btn-danger" onclick="doLogout()"><i class="fas fa-power-off"></i></button></div></div><div class="container"><div class="card card-fixed"><div class="grid-input"><input id="n" placeholder="备注名称"><input id="l" placeholder="监听端口 (如 10000)"><input id="r" placeholder="目标 (例 1.2.3.4:443 或 [2402::1]:443)"><button class="btn btn-primary" onclick="add()"><i class="fas fa-plus"></i> 添加</button><div class="tools-group"><button class="btn btn-primary" onclick="openBatch()" style="background:#8b5cf6"><i class="fas fa-paste"></i> 批量</button><button class="btn btn-danger" onclick="delAll()" style="background:#ef4444"><i class="fas fa-trash"></i> 全删</button><button class="btn btn-primary" onclick="downloadBackup()" style="background:#059669"><i class="fas fa-download"></i> 导出</button><button class="btn btn-danger" onclick="openRestore()" style="background:#d97706"><i class="fas fa-upload"></i> 导入</button></div></div></div><div class="card card-scroll"><div style="padding:1.2rem 1.5rem;font-weight:700;font-size:1rem;opacity:0.8">转发规则管理</div><div class="table-wrapper"><table id="ruleTable"><thead><tr><th>状态</th><th>备注</th><th>监听</th><th>目标</th><th style="width:130px;text-align:right;padding-right:20px">操作</th></tr></thead><tbody id="list"></tbody></table><div id="emptyView" style="display:none;text-align:center;padding:50px;color:#9ca3af"><i class="fas fa-inbox" style="font-size:2rem;display:block;margin-bottom:10px"></i>暂无规则</div></div></div></div><div id="setModal" class="modal"><div class="modal-box"><div class="tab-header"><div class="tab-btn active" onclick="switchTab(0)">管理账户</div><div class="tab-btn" onclick="switchTab(1)">个性背景</div></div><div class="tab-content active" id="tab0"><label>用户名</label><input id="set_u" value="{{USER}}"><label>重置密码 (留空保持不变)</label><input id="set_p" type="password"><div style="margin-top:25px;display:flex;justify-content:flex-end;gap:12px"><button class="btn btn-gray" onclick="closeModal()">取消</button><button class="btn btn-primary" onclick="saveAccount()">确认修改</button></div></div><div class="tab-content" id="tab1"><label>PC端壁纸 URL</label><input id="bg_pc" value="{{BG_PC}}"><label>手机端壁纸 URL</label><input id="bg_mob" value="{{BG_MOBILE}}"><div style="margin-top:25px;display:flex;justify-content:flex-end;gap:12px"><button class="btn btn-gray" onclick="closeModal()">取消</button><button class="btn btn-primary" onclick="saveBg()">应用背景</button></div></div></div></div><div id="editModal" class="modal"><div class="modal-box"><h3>编辑规则</h3><input type="hidden" id="edit_id"><label>备注</label><input id="edit_n"><label>监听端口</label><input id="edit_l"><label>目标地址</label><input id="edit_r"><div style="margin-top:25px;display:flex;justify-content:flex-end;gap:12px"><button class="btn btn-gray" onclick="closeModal()">取消</button><button class="btn btn-primary" onclick="saveEdit()">保存更改</button></div></div></div><div id="batchModal" class="modal"><div class="modal-box" style="max-width:600px"><h3>批量添加规则</h3><p style="color:#666;font-size:0.85rem;margin-bottom:10px">格式：备注,监听端口,目标地址<br>一行一条，例如：<br>日本落地,10001,1.1.1.1:443<br>香港中转,20002,[2402::1]:80</p><textarea id="batch_input" rows="10" style="width:100%;padding:10px;border:1px solid #ddd;border-radius:10px;font-family:monospace" placeholder="备注,监听端口,目标地址"></textarea><div style="margin-top:25px;display:flex;justify-content:flex-end;gap:12px"><button class="btn btn-gray" onclick="closeModal()">取消</button><button class="btn btn-primary" onclick="saveBatch()">开始导入</button></div></div></div><div id="restoreModal" class="modal"><div class="modal-box"><h3>恢复备份</h3><p style="color:#ef4444;font-size:0.9rem;margin-bottom:15px"><i class="fas fa-exclamation-triangle"></i> 警告：导入操作将<b>清空并覆盖</b>当前所有规则！<br>请粘贴之前导出的 JSON 内容：</p><textarea id="restore_input" rows="8" style="width:100%;padding:10px;border:1px solid #ddd;border-radius:10px;font-family:monospace;font-size:0.8rem"></textarea><div style="margin-top:25px;display:flex;justify-content:flex-end;gap:12px"><button class="btn btn-gray" onclick="closeModal()">取消</button><button class="btn btn-danger" onclick="doRestore()">确认覆盖</button></div></div></div><script>let rules=[];const $=id=>document.getElementById(id);async function load(){const r=await fetch('/api/rules');if(r.status===401)location.href='/login';const d=await r.json();rules=d.rules;render()}function render(){const t=$('list');const ev=$('emptyView');const table=$('ruleTable');t.innerHTML='';if(rules.length===0){ev.style.display='block';table.style.display='none'}else{ev.style.display='none';table.style.display='table';rules.forEach(r=>{const row=document.createElement('tr');if(!r.enabled)row.style.opacity='0.6';const isMob=window.innerWidth<768;if(isMob){row.innerHTML=`<td data-label="状态"><span class="status-dot ${r.enabled?'bg-green':'bg-gray'}"></span>${r.enabled?'在线':'暂停'}</td><td data-label="备注"><strong>${r.name}</strong></td><td data-label="监听">${r.listen}</td><td data-label="目标">${r.remote}</td><td data-label="操作"><button class="btn btn-gray" onclick="tog('${r.id}')"><i class="fas ${r.enabled?'fa-pause':'fa-play'}"></i> ${r.enabled?'暂停':'开启'}</button><button class="btn btn-primary" onclick="openEdit('${r.id}')"><i class="fas fa-edit"></i> 编辑</button><button class="btn btn-danger" onclick="del('${r.id}')"><i class="fas fa-trash-alt"></i> 删除</button></td>`;}else{row.innerHTML=`<td data-label="状态"><span class="status-dot ${r.enabled?'bg-green':'bg-gray'}"></span>${r.enabled?'在线':'暂停'}</td><td data-label="备注"><strong>${r.name}</strong></td><td data-label="监听">${r.listen}</td><td data-label="目标">${r.remote}</td><td data-label="操作" style="display:flex;gap:6px;justify-content:flex-end;padding-right:15px"><button class="btn btn-gray" style="padding:6px 10px" onclick="tog('${r.id}')"><i class="fas ${r.enabled?'fa-pause':'fa-play'}"></i></button><button class="btn btn-primary" style="padding:6px 10px" onclick="openEdit('${r.id}')"><i class="fas fa-edit"></i></button><button class="btn btn-danger" style="padding:6px 10px;background:#fee2e2;color:#ef4444" onclick="del('${r.id}')"><i class="fas fa-trash-alt"></i></button></td>`;}t.appendChild(row)})}}
+async function add(){
+    let [n,l,r]=['n','l','r'].map(x=>$(x).value.trim());
+    if(!n) return alert('请输入备注');
+    if(!l) return alert('请输入监听端口');
+    if(!r) return alert('请输入目标地址');
+    if(!l.includes(':'))l='0.0.0.0:'+l;
+    const res = await fetch('/api/rules',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({name:n,listen:l,remote:r})});
+    const d = await res.json();
+    if(d.status === 'error') { alert(d.message); return; }
+    ['n','l','r'].forEach(x=>$(x).value='');load()
+}
+async function tog(id){await fetch(`/api/rules/${id}/toggle`,{method:'POST'});load()}async function del(id){if(confirm('确定删除此规则吗？'))await fetch(`/api/rules/${id}`,{method:'DELETE'});load()}function openEdit(id){const r=rules.find(x=>x.id===id);$('edit_id').value=id;$('edit_n').value=r.name;let listen = r.listen;if(listen.startsWith('0.0.0.0:')) listen = listen.replace('0.0.0.0:', '');$('edit_l').value=listen;$('edit_r').value=r.remote;$('editModal').style.display='flex'}async function saveEdit(){let l = $('edit_l').value;if(!l.includes(':')) l = '0.0.0.0:' + l;const body=JSON.stringify({name:$('edit_n').value,listen:l,remote:$('edit_r').value});const res = await fetch(`/api/rules/${$('edit_id').value}`,{method:'PUT',headers:{'Content-Type':'application/json'},body});const d = await res.json();if(d.status === 'error') { alert(d.message); return; }$('editModal').style.display='none';load()}function openSettings(){$('setModal').style.display='flex';switchTab(0)}function closeModal(){document.querySelectorAll('.modal').forEach(x=>x.style.display='none')}function switchTab(idx){document.querySelectorAll('.tab-btn').forEach((b,i)=>b.classList.toggle('active',i===idx));document.querySelectorAll('.tab-content').forEach((c,i)=>c.classList.toggle('active',i===idx))}async function saveAccount(){await fetch('/api/admin/account',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({username:$('set_u').value,password:$('set_p').value})});alert('账户已更新，请重新登录');location.reload()}async function saveBg(){await fetch('/api/admin/bg',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({bg_pc:$('bg_pc').value,bg_mobile:$('bg_mob').value})});location.reload()}async function doLogout(){await fetch('/logout',{method:'POST'});location.href='/login'}
+function openBatch(){$('batchModal').style.display='flex';$('batch_input').value='';$('batch_input').focus();}
+async function saveBatch(){const raw = $('batch_input').value;if(!raw.trim()) return;const lines = raw.split('\n');const payload = [];for(let line of lines){line = line.trim();if(!line) continue;line = line.replace(/，/g, ',');const parts = line.split(',');if(parts.length < 3) continue;let [n, l, r] = [parts[0].trim(), parts[1].trim(), parts[2].trim()];if(l && !l.includes(':')) l = '0.0.0.0:' + l;if(n && l && r){payload.push({ name: n, listen: l, remote: r });}}if(payload.length === 0){alert('没有识别到有效的规则，请检查格式');return;}const btn = event.target;const oldText = btn.innerText;btn.innerText = '导入中...';btn.disabled = true;try {const res = await fetch('/api/rules/batch', {method: 'POST',headers: {'Content-Type': 'application/json'},body: JSON.stringify(payload)});const d = await res.json();alert(d.message);$('batchModal').style.display='none';load();} catch(e) {alert('导入失败: ' + e);} finally {btn.innerText = oldText;btn.disabled = false;}}
+async function delAll() {
+    if(rules.length === 0) return alert('当前没有规则，无需删除');
+    if(!confirm('⚠️ 确定要清空所有规则吗？\n此操作不可恢复！')) return;
+    const res = await fetch('/api/rules/all', { method: 'DELETE' });
+    const d = await res.json();
+    alert(d.message);
+    load();
+}
+function downloadBackup() {
+    if(rules.length === 0) { alert('当前没有规则，无法导出！'); return; }
+    window.location.href = '/api/backup';
+}
+function openRestore() {$('restoreModal').style.display = 'flex';$('restore_input').value = '';$('restore_input').focus();}
+async function doRestore() {const raw = $('restore_input').value;if (!raw.trim()) return alert('请输入 JSON 内容');let payload;try {payload = JSON.parse(raw);} catch (e) {return alert('JSON 格式错误');}if (!Array.isArray(payload)) {return alert('格式错误：根节点必须是数组');}if (!confirm(`准备恢复 ${payload.length} 条规则，这将覆盖当前所有设置，确定吗？`)) return;const btn = event.target;btn.innerText = '恢复中...';btn.disabled = true;try {const res = await fetch('/api/restore', {method: 'POST',headers: { 'Content-Type': 'application/json' },body: JSON.stringify(payload)});const d = await res.json();alert(d.message);location.reload();} catch (e) {alert('恢复失败: ' + e);btn.innerText = '确认覆盖';btn.disabled = false;}}
+load();window.addEventListener('resize',render);</script></body></html>
+"#;
 EOF
 
-    # 追加 Dashboard HTML (轻量版界面，无监控图表)
-    cat >> src/main.rs << 'EOF'
-const D_HTM:&str=r#"<!DOCTYPE html><html><head><meta charset="utf-8"><meta name="viewport" content="width=device-width"><title>Gost Panel</title><link href="https://cdnjs.cloudflare.com/ajax/libs/font-awesome/6.0.0/css/all.min.css" rel="stylesheet"><style>:root{--p:#2563eb;--bg:#f3f4f6}body{margin:0;font-family:system-ui;background:var(--bg);padding:20px}.nav{display:flex;justify-content:space-between;align-items:center;margin-bottom:20px}.cd{background:#fff;border-radius:10px;padding:20px;box-shadow:0 1px 3px rgba(0,0,0,.1);margin-bottom:20px}.ig{display:grid;grid-template-columns:1fr 1fr 2fr 1fr auto;gap:10px}input,select{padding:10px;border:1px solid #ddd;border-radius:6px}button{padding:10px 15px;border:none;border-radius:6px;cursor:pointer;color:#fff;font-weight:bold}.ba{background:var(--p)}.bd{background:#ef4444}.bg{background:#9ca3af}table{width:100%;border-collapse:collapse}td,th{padding:12px;text-align:left;border-bottom:1px solid #eee}.st{width:8px;height:8px;border-radius:50%;display:inline-block;margin-right:5px}.on{background:#22c55e}.off{background:#9ca3af}.md{display:none;position:fixed;top:0;left:0;width:100%;height:100%;background:rgba(0,0,0,.3);align-items:center;justify-content:center}.mb{background:#fff;padding:20px;width:500px;border-radius:10px}</style></head><body>
-<div class="nav"><h3><i class="fas fa-network-wired"></i> Gost Panel</h3><button class="bd" onclick="LO()"><i class="fas fa-power-off"></i></button></div>
-<div class="cd"><div class="ig"><input id="n" placeholder="Name"><input id="l" placeholder=":Port"><input id="r" placeholder="Target:Port"><select id="t"><option value="tcp">TCP</option><option value="udp">UDP</option></select><button class="ba" onclick="A()">Add</button><button class="bg" onclick="$('bm').style.display='flex'">Batch</button></div></div>
-<div class="cd" style="overflow:auto"><table><thead><tr><th>State</th><th>Name</th><th>Listen</th><th>Proto</th><th>Target</th><th>Op</th></tr></thead><tbody id="ls"></tbody></table></div>
-<div id="bm" class="md"><div class="mb"><h3>Batch Import</h3><textarea id="bi" rows="8" style="width:100%;margin:10px 0" placeholder="Name|:Port|Target:Port"></textarea><div style="text-align:right"><button class="bg" onclick="$('bm').style.display='none'">Cancel</button> <button class="ba" onclick="B()">Import</button></div></div></div>
-<script>const $=i=>document.getElementById(i);
-async function R(){let r=await fetch('/api/rules');if(r.status==401)location.href='/login';let d=await r.json();let h='';d.rules.forEach(x=>{h+=`<tr><td><span class="st ${x.enabled?'on':'off'}"></span>${x.enabled?'Run':'Stop'}</td><td>${x.name}</td><td>${x.listen}</td><td>${x.protocol}</td><td>${x.remote}</td><td><button class="bg" onclick="T('${x.id}')"><i class="fas fa-pause"></i></button> <button class="bd" onclick="D('${x.id}')"><i class="fas fa-trash"></i></button></td></tr>`});$('ls').innerHTML=h}
-async function A(){let n=$('n').value,l=$('l').value,r=$('r').value,t=$('t').value;if(!n||!l)return;await fetch('/api/rules',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({name:n,listen:l,remote:r,protocol:t})});R();$('n').value=''}
-async function B(){let t=$('bi').value.trim();if(!t)return;let q=t.split('\n').map(x=>x.split('|')).filter(x=>x.length==3).map(x=>({name:x[0],listen:x[1],remote:x[2],protocol:'tcp'}));await fetch('/api/rules/batch',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify(q)});$('bm').style.display='none';R()}
-async function T(i){await fetch(`/api/rules/${i}/toggle`,{method:'POST'});R()}async function D(i){if(confirm('Del?'))await fetch(`/api/rules/${i}`,{method:'DELETE'});R()}async function LO(){await fetch('/logout',{method:'POST'});location.href='/login'}
-R();</script></body></html>"#.to_string()
-}
+# 4. 编译安装
+echo -e -n "${CYAN}>>> 编译面板程序 (请耐心等待！)...${RESET}"
+OS_ARCH=$(uname -m)
+if [[ "$OS_ARCH" == "aarch64" ]]; then
+    RUST_TRIPLE="aarch64-unknown-linux-gnu"
+else
+    RUST_TRIPLE="x86_64-unknown-linux-gnu"
+fi
+
+mkdir -p .cargo
+cat > .cargo/config.toml <<EOF
+[target.$RUST_TRIPLE]
+linker = "gcc"
+rustflags = ["-C", "link-arg=-fuse-ld=bfd"]
 EOF
 
-    # 6. 编译 (静默)
-    print_info "正在后台编译 (请稍候)..."
-    /root/.cargo/bin/cargo clean >> "$LOG_FILE" 2>&1
-    /root/.cargo/bin/cargo build --release >> "$LOG_FILE" 2>&1 &
-    spinner $!
+cargo clean >/dev/null 2>&1
+cargo build --release >/dev/null 2>&1 &
+spinner $!
 
-    if [ -f "target/release/gost-panel" ]; then
-        print_ok "编译成功"
-        cp target/release/gost-panel "$BINARY_PATH"
-    else
-        print_err "编译失败! 请查看日志: cat $LOG_FILE"
-        exit 1
-    fi
+if [ -f "target/release/gost-panel" ]; then
+    echo -e "${GREEN} [完成]${RESET}"
+    echo -e -n "${CYAN}>>> 正在部署服务...${RESET}"
+    mv target/release/gost-panel "$PANEL_BIN"
+else
+    echo -e "${RED} [失败]${RESET}"
+    echo -e "${RED}编译出错，请手动运行 cargo build --release 查看详情。${RESET}"
+    exit 1
+fi
 
-    # 7. 服务
-    cat > /etc/systemd/system/gost.service <<EOF
+rm -rf "$WORK_DIR"
+
+# 5. 配置面板服务
+cat > /etc/systemd/system/gost-panel.service <<EOF
 [Unit]
-Description=Gost v3 Core
+Description=Gost Panel Custom
 After=network.target
+
 [Service]
-ExecStart=$GOST_BIN -C $GOST_CONFIG
+User=root
+Environment="PANEL_USER=$DEFAULT_USER"
+Environment="PANEL_PASS=$DEFAULT_PASS"
+Environment="PANEL_PORT=$PANEL_PORT"
+LimitNOFILE=1048576
+LimitNPROC=1048576
+ExecStart=$PANEL_BIN
 Restart=always
-LimitNOFILE=51200
+
 [Install]
 WantedBy=multi-user.target
 EOF
 
-    cat > /etc/systemd/system/gost-panel.service <<EOF
-[Unit]
-Description=Gost Panel
-After=gost.service
-[Service]
-Environment="PANEL_PORT=9794"
-Environment="PANEL_USER=admin"
-Environment="PANEL_PASS=123456"
-ExecStart=$BINARY_PATH
-Restart=always
-[Install]
-WantedBy=multi-user.target
-EOF
+systemctl daemon-reload
+systemctl enable gost-panel >/dev/null 2>&1
+systemctl restart gost-panel >/dev/null 2>&1
+echo -e "${GREEN} [完成]${RESET}"
 
-    systemctl daemon-reload
-    [ ! -f "$GOST_CONFIG" ] && echo '{"services":[],"chains":[]}' > $GOST_CONFIG
-    systemctl enable gost gost-panel >/dev/null 2>&1
-    systemctl restart gost gost-panel
-
-    IP=$(curl -s4 ifconfig.me || hostname -I | awk '{print $1}')
-    echo ""
-    print_ok "安装完成！"
-    echo -e "地址: http://${IP}:9794"
-    echo -e "账号: admin / 123456"
-    read -p "按回车返回菜单..."
-}
-
-
-modify_config() {
-    clear
-    echo -e "${CYAN}>>> 修改面板配置${RESET}"
-    echo "请输入新信息 (不修改请直接回车)"
-    
-    read -p "新端口 (当前默认9794): " new_port
-    read -p "新账号 (当前默认admin): " new_user
-    read -p "新密码 (当前默认123456): " new_pass
-
-    SVC_FILE="/etc/systemd/system/gost-panel.service"
-
-    if [ ! -z "$new_port" ]; then
-        sed -i "s/Environment=\"PANEL_PORT=.*/Environment=\"PANEL_PORT=${new_port}\"/" $SVC_FILE
-    fi
-    if [ ! -z "$new_user" ]; then
-        sed -i "s/Environment=\"PANEL_USER=.*/Environment=\"PANEL_USER=${new_user}\"/" $SVC_FILE
-    fi
-    if [ ! -z "$new_pass" ]; then
-        sed -i "s/Environment=\"PANEL_PASS=.*/Environment=\"PANEL_PASS=${new_pass}\"/" $SVC_FILE
-    fi
-
-    # 强制刷新 JSON 里的账号缓存
-    if [ ! -z "$new_user" ] || [ ! -z "$new_pass" ]; then
-        U=${new_user:-admin}
-        P=${new_pass:-123456}
-        if [ -f "$DATA_FILE" ]; then
-             sed -i "s/\"username\": \".*\"/\"username\": \"$U\"/" $DATA_FILE
-             sed -i "s/\"pass_hash\": \".*\"/\"pass_hash\": \"$P\"/" $DATA_FILE
-        fi
-    fi
-
-    systemctl daemon-reload
-    systemctl restart gost-panel
-    print_ok "配置已更新并重启！"
-    read -p "按回车返回菜单..."
-}
-
-# =========================================================
-#   功能模块 3: 卸载
-# =========================================================
-uninstall_panel() {
-    clear
-    echo -e "${RED}⚠️  高能预警：这将删除面板、Gost及所有配置！${RESET}"
-    read -p "确认卸载？(输入 y 确认): " confirm
-    if [[ "$confirm" != "y" ]]; then return; fi
-
-    print_info "停止服务..."
-    systemctl stop gost gost-panel
-    systemctl disable gost gost-panel
-
-    print_info "删除文件..."
-    rm -f /etc/systemd/system/gost.service
-    rm -f /etc/systemd/system/gost-panel.service
-    rm -f /usr/local/bin/gost
-    rm -f /usr/local/bin/gost-panel
-    rm -rf /etc/gost
-    rm -rf /opt/gost_panel
-    rm -rf /opt/realm_panel
-
-    systemctl daemon-reload
-    print_ok "卸载完成，江湖再见！"
-    read -p "按回车退出..."
-    exit 0
-}
-
-# =========================================================
-#   主菜单
-# =========================================================
-while true; do
-    clear
-    echo -e "${GREEN}====================================${RESET}"
-    echo -e "${GREEN}            Gost v3 面板            ${RESET}"
-    echo -e "${GREEN}====================================${RESET}"
-    
-    if systemctl is-active --quiet gost-panel; then
-        echo -e "状态: ${GREEN}● 运行中${RESET}"
-    else
-        echo -e "状态: ${RED}● 未运行${RESET}"
-    fi
-    echo ""
-    echo -e "1. 安装面板"
-    echo -e "2. 修改配置"
-    echo -e "3. 卸载面板"
-    echo -e "0. 退出"
-    echo ""
-    read -p "请选择 [0-3]: " choice
-
-    case $choice in
-        1) install_panel ;;
-        2) modify_config ;;
-        3) uninstall_panel ;;
-        0) exit 0 ;;
-        *) echo "无效输入"; sleep 1 ;;
-    esac
-done
+IP=$(curl -s4 ifconfig.me || hostname -I | awk '{print $1}')
+echo -e ""
+echo -e "${GREEN}==========================================${RESET}"
+echo -e "${GREEN}           ✅ Gost 面板部署成功          ${RESET}"
+echo -e "${GREEN}==========================================${RESET}"
+echo -e "访问地址 : ${YELLOW}http://${IP}:${PANEL_PORT}${RESET}"
+echo -e "默认用户 : ${YELLOW}${DEFAULT_USER}${RESET}"
+echo -e "默认密码 : ${YELLOW}${DEFAULT_PASS}${RESET}"
+echo -e "------------------------------------------"
