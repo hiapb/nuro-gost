@@ -5,16 +5,17 @@ PANEL_PORT="4795"
 DEFAULT_USER="admin"
 DEFAULT_PASS="123456"
 
-# 路径配置 (改为 Gost 相关路径)
+# 核心路径配置
 GOST_BIN="/usr/local/bin/gost"
 CONFIG_FILE="/etc/gost/config.yaml"
 SERVICE_FILE="/etc/systemd/system/gost.service"
 TMP_DIR="/tmp/gost_install"
 
-# 面板路径 
+# 面板路径
 WORK_DIR="/opt/gost_panel"
 PANEL_BIN="/usr/local/bin/gost-panel"
 PANEL_DATA="/etc/gost/panel_data.json"
+PANEL_SERVICE="/etc/systemd/system/gost-panel.service"
 
 # 颜色
 GREEN="\033[32m"
@@ -24,9 +25,9 @@ CYAN="\033[36m"
 RESET="\033[0m"
 # =========================================
 
-# 自定义链名称 
-CHAIN_IN="REALM_IN"
-CHAIN_OUT="REALM_OUT"
+# 自定义链名称 (用于流量监控)
+CHAIN_IN="GOST_IN"
+CHAIN_OUT="GOST_OUT"
 
 need_cmd() {
     if ! command -v "$1" >/dev/null 2>&1; then
@@ -57,8 +58,8 @@ run_step() {
     echo -e "${GREEN} [完成]${RESET}"
 }
 
-prepare_env_and_fix_compilation() {
-    echo -e "${CYAN}>>> 正在优化编译环境...${RESET}"
+prepare_env() {
+    echo -e "${CYAN}>>> 正在准备环境...${RESET}"
     if [ -f /etc/debian_version ]; then
         apt-get update -y >/dev/null 2>&1
         apt-get install -y curl wget tar git build-essential pkg-config libssl-dev iptables >/dev/null 2>&1
@@ -69,7 +70,7 @@ prepare_env_and_fix_compilation() {
     fi
 
     if ! command -v cargo &> /dev/null; then
-        echo -e -n "${CYAN}>>> 安装 Rust 编译器...${RESET}"
+        echo -e -n "${CYAN}>>> 正在安装 Rust 编译器...${RESET}"
         curl --proto '=https' --tlsv1.2 -sSf https://sh.rustup.rs | sh -s -- -y >/dev/null 2>&1 &
         spinner $!
         source "$HOME/.cargo/env"
@@ -79,54 +80,49 @@ prepare_env_and_fix_compilation() {
     fi
 }
 
-# 安装 Gost v3
-install_gost_smart() {
+install_gost() {
     need_cmd curl
     need_cmd tar
     need_cmd systemctl
 
-    echo -e "${CYAN}>>> 检查 Gost 环境...${RESET}"
-    
-    # 简单的版本检查逻辑
     if [ -f "$GOST_BIN" ]; then
-        local_ver=$($GOST_BIN -V 2>&1 | awk '{print $2}')
-        echo -e "${GREEN}本地已安装 Gost ($local_ver)，跳过下载${RESET}"
-    else
-        echo -e "${YELLOW}未检测到 Gost，准备下载 v3 版本...${RESET}"
-        # 下载 Gost V3 (根据架构)
-        ARCH=$(uname -m)
-        case "$ARCH" in
-            x86_64) GOST_ARCH="linux_amd64" ;;
-            aarch64) GOST_ARCH="linux_arm64" ;;
-            *) echo -e "${RED}不支持的架构: $ARCH${RESET}"; exit 1 ;;
-        esac
-        
-        # 获取最新 Release (这里简化直接构造 URL，或者使用固定版本保证稳定性)
-        # 使用 GitHub API 获取最新 tag
-        TAG=$(curl -s https://api.github.com/repos/go-gost/gost/releases/latest | grep '"tag_name":' | sed -E 's/.*"([^"]+)".*/\1/')
-        [ -z "$TAG" ] && TAG="v3.0.0" # Fallback
-        
-        URL="https://github.com/go-gost/gost/releases/download/${TAG}/gost_${TAG#v}_${GOST_ARCH}.tar.gz"
-        
-        mkdir -p "$TMP_DIR"
-        if ! curl -L -o "$TMP_DIR/gost.tar.gz" "$URL"; then
-             echo -e "${RED}Gost 下载失败${RESET}"; exit 1
-        fi
-        
-        tar -xzf "$TMP_DIR/gost.tar.gz" -C "$TMP_DIR"
-        mv "$TMP_DIR/gost" "$GOST_BIN"
-        chmod +x "$GOST_BIN"
-        rm -rf "$TMP_DIR"
+        local v=$($GOST_BIN -V 2>&1 | awk '{print $2}')
+        echo -e "${GREEN}>>> 检测到 Gost 已安装 ($v)${RESET}"
+        return 0
+    fi
+    
+    echo -e "${CYAN}>>> 正在安装 Gost V3...${RESET}"
+    ARCH=$(uname -m)
+    case "$ARCH" in
+        x86_64) GOST_ARCH="linux_amd64" ;;
+        aarch64) GOST_ARCH="linux_arm64" ;;
+        *) echo -e "${RED}不支持的架构: $ARCH${RESET}"; exit 1 ;;
+    esac
+    
+    # 获取最新版本
+    TAG=$(curl -s https://api.github.com/repos/go-gost/gost/releases/latest | grep '"tag_name":' | sed -E 's/.*"([^"]+)".*/\1/')
+    [ -z "$TAG" ] && TAG="v3.0.0"
+    
+    URL="https://github.com/go-gost/gost/releases/download/${TAG}/gost_${TAG#v}_${GOST_ARCH}.tar.gz"
+    
+    mkdir -p "$TMP_DIR"
+    if ! curl -L -o "$TMP_DIR/gost.tar.gz" "$URL"; then
+        echo -e "${RED}下载 Gost 失败${RESET}"
+        exit 1
     fi
 
+    tar -xzf "$TMP_DIR/gost.tar.gz" -C "$TMP_DIR"
+    mv "$TMP_DIR/gost" "$GOST_BIN"
+    chmod +x "$GOST_BIN"
+    rm -rf "$TMP_DIR"
+
+    # 创建 Gost 配置目录和空配置
     mkdir -p "$(dirname "$CONFIG_FILE")"
-    
-    # 初始化空配置
     if [ ! -f "$CONFIG_FILE" ]; then
         echo 'services: []' > "$CONFIG_FILE"
     fi
 
-    # 创建 Systemd 服务 (支持 Reload 信号)
+    # 创建 Gost 服务
     cat > "$SERVICE_FILE" <<EOF
 [Unit]
 Description=Gost Proxy Service
@@ -145,23 +141,23 @@ WantedBy=multi-user.target
 EOF
 
     systemctl daemon-reload
-    systemctl enable gost >/dev/null 2>&1 || true
+    systemctl enable gost >/dev/null 2>&1
     systemctl restart gost
-    echo -e "${GREEN}Gost v3 安装/更新完成${RESET}"
+    echo -e "${GREEN} [完成]${RESET}"
 }
 
 if [ "$EUID" -ne 0 ]; then
-    echo -e "${RED}请以 root 用户运行！${RESET}"
+    echo -e "${RED}请使用 root 用户运行此脚本！${RESET}"
     exit 1
 fi
 
 clear
 echo -e "${GREEN}==========================================${RESET}"
-echo -e "${GREEN}              Gost面板 一键部署             ${RESET}"
+echo -e "${GREEN}           Gost 面板 (V3) 一键部署          ${RESET}"
 echo -e "${GREEN}==========================================${RESET}"
 
-prepare_env_and_fix_compilation
-install_gost_smart
+prepare_env
+install_gost
 
 mkdir -p "$(dirname "$PANEL_DATA")"
 run_step "生成面板源代码" "
@@ -170,11 +166,11 @@ mkdir -p '$WORK_DIR/src'
 "
 cd "$WORK_DIR"
 
-# 注意：添加了 serde_yaml 依赖
+# 写入 Cargo.toml
 cat > Cargo.toml <<EOF
 [package]
-name = "realm-panel"
-version = "4.0.0"
+name = "gost-panel"
+version = "1.0.0"
 edition = "2021"
 
 [dependencies]
@@ -189,6 +185,7 @@ uuid = { version = "1", features = ["v4"] }
 chrono = { version = "0.4", features = ["serde"] }
 EOF
 
+# 写入 Rust 源码
 cat > src/main.rs << 'EOF'
 use axum::{
     extract::{State, Path},
@@ -203,12 +200,13 @@ use std::{fs, process::Command, sync::{Arc, Mutex}, path::Path as FilePath, time
 use tower_cookies::{Cookie, Cookies, CookieManagerLayer};
 use chrono::prelude::*;
 
-// 核心配置修改：指向 Gost 的配置文件
+// 路径配置：必须与 Bash 脚本一致
 const GOST_CONFIG: &str = "/etc/gost/config.yaml";
-const DATA_FILE: &str = "/etc/realm/panel_data.json";
+const DATA_FILE: &str = "/etc/gost/panel_data.json";
 
-const CHAIN_IN: &str = "REALM_IN";
-const CHAIN_OUT: &str = "REALM_OUT";
+// IPTABLES 链名称
+const CHAIN_IN: &str = "GOST_IN";
+const CHAIN_OUT: &str = "GOST_OUT";
 
 #[derive(Serialize, Deserialize, Clone, Debug)]
 struct Rule {
@@ -266,7 +264,7 @@ async fn main() {
         last_traffic_map: Mutex::new(HashMap::new()),
     });
     
-    // 初始化时同步一次防火墙规则
+    // 初始化：同步防火墙规则并生成 Gost 配置
     {
         let data = state.data.lock().unwrap();
         flush_firewall_chains(); 
@@ -275,7 +273,6 @@ async fn main() {
                  add_iptables_rule(rule);
              }
         }
-        // 确保 Gost 配置与数据同步
         save_config_gost(&data);
     }
 
@@ -304,13 +301,12 @@ async fn main() {
         .layer(CookieManagerLayer::new())
         .with_state(state);
 
-    let port = std::env::var("PANEL_PORT").unwrap_or_else(|_| "4794".to_string());
+    let port = std::env::var("PANEL_PORT").unwrap_or_else(|_| "4795".to_string());
     println!("Server running on port {}", port);
     let listener = tokio::net::TcpListener::bind(format!("0.0.0.0:{}", port)).await.unwrap();
     axum::serve(listener, app).await.unwrap();
 }
 
-// --- 防火墙相关 (保持不变，因为是基于端口计费，与后端引擎无关) ---
 fn init_firewall_chains() {
     let _ = Command::new("iptables").args(["-N", CHAIN_IN]).status();
     let _ = Command::new("iptables").args(["-N", CHAIN_OUT]).status();
@@ -443,12 +439,9 @@ fn update_traffic_and_check(state: &Arc<AppState>) {
     }
 }
 
-// --------------------------------------------------------
-
 fn load_or_init_data() -> AppData {
     if let Ok(content) = fs::read_to_string(DATA_FILE) {
         if let Ok(mut data) = serde_json::from_str::<AppData>(&content) {
-            // 清理旧的 system-keepalive 规则（Gost 不需要）
             data.rules.retain(|r| r.name != "system-keepalive");
             return data;
         }
@@ -470,7 +463,7 @@ fn save_json(data: &AppData) {
     let _ = fs::write(DATA_FILE, json_str);
 }
 
-// 核心改变：生成 Gost v3 的 YAML 配置
+// 核心逻辑：生成 Gost v3 YAML 配置并热重载
 fn save_config_gost(data: &AppData) {
     let mut services = vec![];
     let mut chains = vec![];
@@ -480,7 +473,7 @@ fn save_config_gost(data: &AppData) {
 
         let chain_name = format!("chain-{}", rule.id);
         
-        // 1. 创建 Chain (定义转发目标)
+        // 1. 创建转发链
         chains.push(json!({
             "name": chain_name,
             "hops": [
@@ -494,30 +487,20 @@ fn save_config_gost(data: &AppData) {
             ]
         }));
 
-        // 2. 创建 TCP Service
+        // 2. 创建 TCP 服务
         services.push(json!({
             "name": format!("service-{}-tcp", rule.id),
-            "addr": rule.listen, // Gost 会自动识别并监听
-            "handler": {
-                "type": "tcp",
-                "chain": chain_name
-            },
-            "listener": {
-                "type": "tcp"
-            }
+            "addr": rule.listen,
+            "handler": { "type": "tcp", "chain": chain_name },
+            "listener": { "type": "tcp" }
         }));
 
-        // 3. 创建 UDP Service
+        // 3. 创建 UDP 服务
         services.push(json!({
             "name": format!("service-{}-udp", rule.id),
             "addr": rule.listen,
-            "handler": {
-                "type": "udp",
-                "chain": chain_name
-            },
-            "listener": {
-                "type": "udp"
-            }
+            "handler": { "type": "udp", "chain": chain_name },
+            "listener": { "type": "udp" }
         }));
     }
 
@@ -526,13 +509,11 @@ fn save_config_gost(data: &AppData) {
         "chains": chains
     });
 
-    // 写入配置
     if let Ok(yaml_str) = serde_yaml::to_string(&config_yaml) {
         let _ = fs::write(GOST_CONFIG, yaml_str);
     }
 
-    // 热更新 (HUP Reload)
-    // Gost v3 收到 SIGHUP 会对比配置差异，实现不断流更新
+    // 热重载 Gost (SIGHUP)
     let _ = Command::new("systemctl").arg("reload").arg("gost").status();
 }
 
@@ -542,8 +523,6 @@ fn check_auth(cookies: &Cookies, state: &AppData) -> bool {
     }
     false
 }
-
-// --- 路由处理函数 (逻辑保持不变，调用 save_config_gost 替代 save_config_toml) ---
 
 async fn index_page(cookies: Cookies, State(state): State<Arc<AppState>>) -> Response {
     let data = state.data.lock().unwrap();
@@ -593,7 +572,7 @@ async fn add_rule(cookies: Cookies, State(state): State<Arc<AppState>>, Json(req
     let mut data = state.data.lock().unwrap();
     if !check_auth(&cookies, &data) { return StatusCode::UNAUTHORIZED.into_response(); }
     if req.name.trim().is_empty() || req.listen.trim().is_empty() || req.remote.trim().is_empty() {
-        return Json(serde_json::json!({"status":"error", "message": "所有字段都不能为空！"})).into_response();
+        return Json(serde_json::json!({"status":"error", "message": "所有字段必填！"})).into_response();
     }
     let new_port = get_port(&req.listen);
     if new_port.is_empty() { return Json(serde_json::json!({"status":"error", "message": "端口格式错误"})).into_response(); }
@@ -638,7 +617,7 @@ async fn delete_all_rules(cookies: Cookies, State(state): State<Arc<AppState>>) 
     flush_firewall_chains();
     data.rules.clear();
     save_json(&data); save_config_gost(&data); 
-    Json(serde_json::json!({"status":"ok", "message": "所有规则已清空"})).into_response()
+    Json(serde_json::json!({"status":"ok"})).into_response()
 }
 
 async fn download_backup(cookies: Cookies, State(state): State<Arc<AppState>>) -> Response {
@@ -647,7 +626,7 @@ async fn download_backup(cookies: Cookies, State(state): State<Arc<AppState>>) -
     let json_str = serde_json::to_string_pretty(&data.rules).unwrap();
     Response::builder()
         .header("Content-Type", "application/json")
-        .header("Content-Disposition", "attachment; filename=\"realm_backup.json\"")
+        .header("Content-Disposition", "attachment; filename=\"gost_backup.json\"")
         .body(axum::body::Body::from(json_str))
         .unwrap()
 }
@@ -655,7 +634,7 @@ async fn download_backup(cookies: Cookies, State(state): State<Arc<AppState>>) -
 async fn restore_backup(cookies: Cookies, State(state): State<Arc<AppState>>, Json(backup_rules): Json<Vec<Rule>>) -> Response {
     let mut data = state.data.lock().unwrap();
     if !check_auth(&cookies, &data) { return StatusCode::UNAUTHORIZED.into_response(); }
-    if backup_rules.is_empty() { return Json(serde_json::json!({"status": "error", "message": "导入的数据为空"})).into_response(); }
+    if backup_rules.is_empty() { return Json(serde_json::json!({"status": "error", "message": "导入数据为空"})).into_response(); }
     flush_firewall_chains();
     data.rules = backup_rules;
     for r in &data.rules { if r.enabled { add_iptables_rule(r); } }
@@ -748,13 +727,12 @@ async fn update_bg(cookies: Cookies, State(state): State<Arc<AppState>>, Json(re
     Json(serde_json::json!({"status":"ok"})).into_response()
 }
 
-// === HTML 模板保持完全不变 ===
 const LOGIN_HTML: &str = r#"
-<!DOCTYPE html><html><head><meta charset="utf-8"><meta name="viewport" content="width=device-width, initial-scale=1, maximum-scale=1, user-scalable=no"><title>Realm Login</title><style>*{margin:0;padding:0;box-sizing:border-box}body{height:100vh;width:100vw;overflow:hidden;display:flex;justify-content:center;align-items:center;font-family:-apple-system,BlinkMacSystemFont,"Segoe UI",Roboto,sans-serif;background:url('{{BG_PC}}') no-repeat center center/cover;color:#374151}@media(max-width:768px){body{background-image:url('{{BG_MOBILE}}')}}.overlay{position:absolute;top:0;left:0;width:100%;height:100%;background:rgba(0,0,0,0.05)}.box{position:relative;z-index:2;background:rgba(255,255,255,0.3);backdrop-filter:blur(25px);-webkit-backdrop-filter:blur(25px);padding:2.5rem;border-radius:24px;border:1px solid rgba(255,255,255,0.4);box-shadow:0 8px 32px rgba(0,0,0,0.05);width:90%;max-width:380px;text-align:center}h2{margin-bottom:2rem;color:#374151;font-weight:600;letter-spacing:1px}input{width:100%;padding:14px;margin-bottom:1.2rem;border:1px solid rgba(255,255,255,0.5);border-radius:12px;outline:none;background:rgba(255,255,255,0.5);transition:0.3s;color:#374151}input:focus{background:rgba(255,255,255,0.9);border-color:#3b82f6}button{width:100%;padding:14px;background:rgba(59,130,246,0.85);color:white;border:none;border-radius:12px;cursor:pointer;font-weight:600;font-size:1rem;transition:0.3s;backdrop-filter:blur(5px)}button:hover{background:#2563eb;transform:translateY(-1px)}</style></head><body><div class="overlay"></div><div class="box"><h2>Realm Panel</h2><form onsubmit="doLogin(event)"><input type="text" id="u" placeholder="Username" required><input type="password" id="p" placeholder="Password" required><button type="submit" id="btn">登 录</button></form></div><script>async function doLogin(e){e.preventDefault();const b=document.getElementById('btn');b.innerText='登录中...';b.disabled=true;const res=await fetch('/login',{method:'POST',headers:{'Content-Type':'application/x-www-form-urlencoded'},body:`username=${encodeURIComponent(document.getElementById('u').value)}&password=${encodeURIComponent(document.getElementById('p').value)}`});if(res.redirected){location.href=res.url}else if(res.ok){location.href='/'}else{alert('用户名或密码错误');b.innerText='登 录';b.disabled=false}}</script></body></html>
+<!DOCTYPE html><html><head><meta charset="utf-8"><meta name="viewport" content="width=device-width, initial-scale=1, maximum-scale=1, user-scalable=no"><title>Gost Login</title><style>*{margin:0;padding:0;box-sizing:border-box}body{height:100vh;width:100vw;overflow:hidden;display:flex;justify-content:center;align-items:center;font-family:-apple-system,BlinkMacSystemFont,"Segoe UI",Roboto,sans-serif;background:url('{{BG_PC}}') no-repeat center center/cover;color:#374151}@media(max-width:768px){body{background-image:url('{{BG_MOBILE}}')}}.overlay{position:absolute;top:0;left:0;width:100%;height:100%;background:rgba(0,0,0,0.05)}.box{position:relative;z-index:2;background:rgba(255,255,255,0.3);backdrop-filter:blur(25px);-webkit-backdrop-filter:blur(25px);padding:2.5rem;border-radius:24px;border:1px solid rgba(255,255,255,0.4);box-shadow:0 8px 32px rgba(0,0,0,0.05);width:90%;max-width:380px;text-align:center}h2{margin-bottom:2rem;color:#374151;font-weight:600;letter-spacing:1px}input{width:100%;padding:14px;margin-bottom:1.2rem;border:1px solid rgba(255,255,255,0.5);border-radius:12px;outline:none;background:rgba(255,255,255,0.5);transition:0.3s;color:#374151}input:focus{background:rgba(255,255,255,0.9);border-color:#3b82f6}button{width:100%;padding:14px;background:rgba(59,130,246,0.85);color:white;border:none;border-radius:12px;cursor:pointer;font-weight:600;font-size:1rem;transition:0.3s;backdrop-filter:blur(5px)}button:hover{background:#2563eb;transform:translateY(-1px)}</style></head><body><div class="overlay"></div><div class="box"><h2>Gost Panel</h2><form onsubmit="doLogin(event)"><input type="text" id="u" placeholder="Username" required><input type="password" id="p" placeholder="Password" required><button type="submit" id="btn">登 录</button></form></div><script>async function doLogin(e){e.preventDefault();const b=document.getElementById('btn');b.innerText='登录中...';b.disabled=true;const res=await fetch('/login',{method:'POST',headers:{'Content-Type':'application/x-www-form-urlencoded'},body:`username=${encodeURIComponent(document.getElementById('u').value)}&password=${encodeURIComponent(document.getElementById('p').value)}`});if(res.redirected){location.href=res.url}else if(res.ok){location.href='/'}else{alert('用户名或密码错误');b.innerText='登 录';b.disabled=false}}</script></body></html>
 "#;
 
 const DASHBOARD_HTML: &str = r#"
-<!DOCTYPE html><html><head><meta charset="utf-8"><meta name="viewport" content="width=device-width, initial-scale=1, maximum-scale=1, user-scalable=no, viewport-fit=cover"><title>Realm Panel</title><link href="https://cdnjs.cloudflare.com/ajax/libs/font-awesome/6.0.0/css/all.min.css" rel="stylesheet"><style>:root{--primary:#3b82f6;--danger:#f87171;--success:#34d399;--text-main:#374151}::-webkit-scrollbar{width:5px;height:5px}::-webkit-scrollbar-thumb{background:rgba(0,0,0,0.1);border-radius:10px}*{box-sizing:border-box}body{font-family:-apple-system,BlinkMacSystemFont,"Segoe UI",Roboto,sans-serif;margin:0;padding:0;height:100vh;height:100dvh;overflow:hidden;background:url('{{BG_PC}}') no-repeat center center/cover;display:flex;flex-direction:column;color:var(--text-main)}@media(max-width:768px){body{background-image:url('{{BG_MOBILE}}')}}.navbar{flex:0 0 auto;background:rgba(255,255,255,0.3);backdrop-filter:blur(25px);-webkit-backdrop-filter:blur(25px);border-bottom:1px solid rgba(255,255,255,0.3);padding:0.8rem 2rem;display:flex;justify-content:space-between;align-items:center;z-index:10}.brand{font-weight:700;font-size:1.1rem;color:var(--text-main);display:flex;align-items:center;gap:10px}.container{flex:1;display:flex;flex-direction:column;max-width:1100px;margin:1.5rem auto;width:95%;overflow:hidden}.card-fixed{background:rgba(255,255,255,0.3);backdrop-filter:blur(20px);border:1px solid rgba(255,255,255,0.4);border-radius:18px;padding:1.2rem;margin-bottom:1.5rem;box-shadow:0 4px 15px rgba(0,0,0,0.03)}.card-scroll{flex:1;background:rgba(255,255,255,0.25);backdrop-filter:blur(20px);border:1px solid rgba(255,255,255,0.4);border-radius:18px;display:flex;flex-direction:column;overflow:hidden;box-shadow:0 4px 15px rgba(0,0,0,0.03)}.table-wrapper{flex:1;overflow-y:auto;padding:0 1.5rem 1.5rem}table{width:100%;border-collapse:separate;border-spacing:0 10px}
+<!DOCTYPE html><html><head><meta charset="utf-8"><meta name="viewport" content="width=device-width, initial-scale=1, maximum-scale=1, user-scalable=no, viewport-fit=cover"><title>Gost Panel</title><link href="https://cdnjs.cloudflare.com/ajax/libs/font-awesome/6.0.0/css/all.min.css" rel="stylesheet"><style>:root{--primary:#3b82f6;--danger:#f87171;--success:#34d399;--text-main:#374151}::-webkit-scrollbar{width:5px;height:5px}::-webkit-scrollbar-thumb{background:rgba(0,0,0,0.1);border-radius:10px}*{box-sizing:border-box}body{font-family:-apple-system,BlinkMacSystemFont,"Segoe UI",Roboto,sans-serif;margin:0;padding:0;height:100vh;height:100dvh;overflow:hidden;background:url('{{BG_PC}}') no-repeat center center/cover;display:flex;flex-direction:column;color:var(--text-main)}@media(max-width:768px){body{background-image:url('{{BG_MOBILE}}')}}.navbar{flex:0 0 auto;background:rgba(255,255,255,0.3);backdrop-filter:blur(25px);-webkit-backdrop-filter:blur(25px);border-bottom:1px solid rgba(255,255,255,0.3);padding:0.8rem 2rem;display:flex;justify-content:space-between;align-items:center;z-index:10}.brand{font-weight:700;font-size:1.1rem;color:var(--text-main);display:flex;align-items:center;gap:10px}.container{flex:1;display:flex;flex-direction:column;max-width:1100px;margin:1.5rem auto;width:95%;overflow:hidden}.card-fixed{background:rgba(255,255,255,0.3);backdrop-filter:blur(20px);border:1px solid rgba(255,255,255,0.4);border-radius:18px;padding:1.2rem;margin-bottom:1.5rem;box-shadow:0 4px 15px rgba(0,0,0,0.03)}.card-scroll{flex:1;background:rgba(255,255,255,0.25);backdrop-filter:blur(20px);border:1px solid rgba(255,255,255,0.4);border-radius:18px;display:flex;flex-direction:column;overflow:hidden;box-shadow:0 4px 15px rgba(0,0,0,0.03)}.table-wrapper{flex:1;overflow-y:auto;padding:0 1.5rem 1.5rem}table{width:100%;border-collapse:separate;border-spacing:0 10px}
 thead th{position:sticky;top:0;background:rgba(255,255,255,0.4);backdrop-filter:blur(15px);z-index:5;padding:14px 12px;text-align:left;font-size:0.85rem;text-transform:uppercase;letter-spacing:1px;color:#6b7280;border-top:1px solid rgba(255,255,255,0.3);border-bottom:1px solid rgba(255,255,255,0.3)}
 thead th:first-child{border-top-left-radius:15px;border-bottom-left-radius:15px;border-left:1px solid rgba(255,255,255,0.3)}
 thead th:last-child{border-top-right-radius:15px;border-bottom-right-radius:15px;border-right:1px solid rgba(255,255,255,0.3)}
@@ -768,7 +746,7 @@ td:last-child{border-right:1px solid rgba(255,255,255,0.3);border-top-right-radi
 .info-row{display:flex;justify-content:space-between;margin-bottom:8px;font-size:0.9rem}.info-val{font-weight:600}
 .progress-bar{width:100%;height:10px;background:rgba(0,0,0,0.1);border-radius:5px;overflow:hidden;margin-top:5px}.progress-fill{height:100%;background:var(--primary);width:0%}
 .expire-warning{color:var(--danger);font-size:0.8rem;margin-top:2px}
-@media(max-width:768px){.grid-input{grid-template-columns:1fr; gap:10px}.navbar{padding:0.8rem 1rem}.nav-text{display:none}thead{display:none}tbody tr{display:flex;flex-direction:column;border-radius:18px!important;margin-bottom:12px;padding:15px;border:1px solid rgba(255,255,255,0.3);background:rgba(255,255,255,0.4)}td{padding:6px 0;display:flex;justify-content:space-between;border-radius:0!important;align-items:center;border:none;background:transparent}td::before{content:attr(data-label);color:#9ca3af;font-size:0.85rem}td[data-label="操作"]{justify-content:flex-end;gap:10px;margin-top:8px;padding-top:10px;border-top:1px solid rgba(0,0,0,0.05)}td[data-label="操作"] .btn{flex:none;width:auto;padding:6px 14px;border-radius:8px;font-size:0.85rem}td[data-label="操作"] .btn-gray{background:transparent;border:1px solid rgba(0,0,0,0.15);color:#555}td[data-label="操作"] .btn-primary{background:var(--primary);color:white}td[data-label="操作"] .btn-danger{background:rgba(239,68,68,0.1);color:var(--danger);border:1px solid rgba(239,68,68,0.2)}.tools-group{width:100%;margin-top:5px}.tools-group .btn{flex:1;justify-content:center;padding:10px 0;font-size:0.85rem}}</style></head><body><div class="navbar"><div class="brand"><i class="fas fa-layer-group"></i> <span class="nav-text">Realm 转发面板</span></div><div class="nav-actions" style="display:flex;gap:15px"><button class="btn btn-gray" onclick="openSettings()"><i class="fas fa-sliders-h"></i> <span class="nav-text">面板设置</span></button><button class="btn btn-danger" onclick="doLogout()"><i class="fas fa-power-off"></i></button></div></div><div class="container"><div class="card card-fixed"><div class="grid-input"><input id="n" placeholder="备注名称"><input id="l" placeholder="监听端口 (如 10000)"><input id="r" placeholder="目标 (例 1.2.3.4:443)"><button class="btn btn-primary" onclick="openAddModal()"><i class="fas fa-plus"></i> 添加</button><div class="tools-group"><button class="btn btn-primary" onclick="openBatch()" style="background:#8b5cf6"><i class="fas fa-paste"></i> 批量</button><button class="btn btn-danger" onclick="delAll()" style="background:#ef4444"><i class="fas fa-trash"></i> 全删</button><button class="btn btn-primary" onclick="downloadBackup()" style="background:#059669"><i class="fas fa-download"></i> 导出</button><button class="btn btn-danger" onclick="openRestore()" style="background:#d97706"><i class="fas fa-upload"></i> 导入</button></div></div></div><div class="card card-scroll"><div style="padding:1.2rem 1.5rem;font-weight:700;font-size:1rem;opacity:0.8">转发规则管理</div><div class="table-wrapper"><table id="ruleTable"><thead><tr><th>状态</th><th>备注</th><th>监听</th><th>目标</th><th>流量 (In/Out)</th><th style="width:180px;text-align:right;padding-right:20px">操作</th></tr></thead><tbody id="list"></tbody></table><div id="emptyView" style="display:none;text-align:center;padding:50px;color:#9ca3af"><i class="fas fa-inbox" style="font-size:2rem;display:block;margin-bottom:10px"></i>暂无规则</div></div></div></div>
+@media(max-width:768px){.grid-input{grid-template-columns:1fr; gap:10px}.navbar{padding:0.8rem 1rem}.nav-text{display:none}thead{display:none}tbody tr{display:flex;flex-direction:column;border-radius:18px!important;margin-bottom:12px;padding:15px;border:1px solid rgba(255,255,255,0.3);background:rgba(255,255,255,0.4)}td{padding:6px 0;display:flex;justify-content:space-between;border-radius:0!important;align-items:center;border:none;background:transparent}td::before{content:attr(data-label);color:#9ca3af;font-size:0.85rem}td[data-label="操作"]{justify-content:flex-end;gap:10px;margin-top:8px;padding-top:10px;border-top:1px solid rgba(0,0,0,0.05)}td[data-label="操作"] .btn{flex:none;width:auto;padding:6px 14px;border-radius:8px;font-size:0.85rem}td[data-label="操作"] .btn-gray{background:transparent;border:1px solid rgba(0,0,0,0.15);color:#555}td[data-label="操作"] .btn-primary{background:var(--primary);color:white}td[data-label="操作"] .btn-danger{background:rgba(239,68,68,0.1);color:var(--danger);border:1px solid rgba(239,68,68,0.2)}.tools-group{width:100%;margin-top:5px}.tools-group .btn{flex:1;justify-content:center;padding:10px 0;font-size:0.85rem}}</style></head><body><div class="navbar"><div class="brand"><i class="fas fa-layer-group"></i> <span class="nav-text">Gost 转发面板</span></div><div class="nav-actions" style="display:flex;gap:15px"><button class="btn btn-gray" onclick="openSettings()"><i class="fas fa-sliders-h"></i> <span class="nav-text">面板设置</span></button><button class="btn btn-danger" onclick="doLogout()"><i class="fas fa-power-off"></i></button></div></div><div class="container"><div class="card card-fixed"><div class="grid-input"><input id="n" placeholder="备注名称"><input id="l" placeholder="监听端口 (如 10000)"><input id="r" placeholder="目标 (例 1.2.3.4:443)"><button class="btn btn-primary" onclick="openAddModal()"><i class="fas fa-plus"></i> 添加</button><div class="tools-group"><button class="btn btn-primary" onclick="openBatch()" style="background:#8b5cf6"><i class="fas fa-paste"></i> 批量</button><button class="btn btn-danger" onclick="delAll()" style="background:#ef4444"><i class="fas fa-trash"></i> 全删</button><button class="btn btn-primary" onclick="downloadBackup()" style="background:#059669"><i class="fas fa-download"></i> 导出</button><button class="btn btn-danger" onclick="openRestore()" style="background:#d97706"><i class="fas fa-upload"></i> 导入</button></div></div></div><div class="card card-scroll"><div style="padding:1.2rem 1.5rem;font-weight:700;font-size:1rem;opacity:0.8">转发规则管理</div><div class="table-wrapper"><table id="ruleTable"><thead><tr><th>状态</th><th>备注</th><th>监听</th><th>目标</th><th>流量 (In/Out)</th><th style="width:180px;text-align:right;padding-right:20px">操作</th></tr></thead><tbody id="list"></tbody></table><div id="emptyView" style="display:none;text-align:center;padding:50px;color:#9ca3af"><i class="fas fa-inbox" style="font-size:2rem;display:block;margin-bottom:10px"></i>暂无规则</div></div></div></div>
 <div id="ruleModal" class="modal"><div class="modal-box"><h3 id="modalTitle">添加规则</h3><input type="hidden" id="edit_id"><label>备注</label><input id="mod_n"><label>监听端口</label><input id="mod_l"><label>目标地址</label><input id="mod_r"><label>到期时间 (留空不限制)</label><input type="datetime-local" id="mod_e"><label>流量限制 (留空或0不限制)</label><div style="display:flex;gap:10px"><input id="mod_t_val" type="number" placeholder="数值" style="flex:1"><select id="mod_t_unit" style="padding:10px;border-radius:10px;border:1px solid rgba(0,0,0,0.05);background:rgba(255,255,255,0.5)"><option value="MB">MB</option><option value="GB">GB</option></select></div><div style="margin-top:25px;display:flex;justify-content:flex-end;gap:12px"><button class="btn btn-gray" onclick="closeModal()">取消</button><button class="btn btn-primary" onclick="saveRule()">保存</button></div></div></div>
 <div id="viewModal" class="modal"><div class="modal-box"><h3 style="margin-bottom:20px;border-bottom:1px solid #eee;padding-bottom:10px">规则详情</h3><div class="info-row"><span>备注</span><span class="info-val" id="view_n"></span></div><div class="info-row"><span>监听</span><span class="info-val" id="view_l"></span></div><div class="info-row"><span>目标</span><span class="info-val" id="view_r"></span></div><div style="margin:15px 0;border-top:1px dashed #ddd;padding-top:10px"></div><div id="view_expire_sec"><div class="info-row"><span>到期时间</span><span class="info-val" id="view_e_date"></span></div><div style="text-align:right;font-size:0.8rem;color:#666" id="view_e_remain"></div></div><div style="margin:15px 0;border-top:1px dashed #ddd;padding-top:10px"></div><div id="view_traffic_sec"><div class="info-row"><span>流量使用 (Max)</span><span class="info-val"><span id="view_t_used"></span> / <span id="view_t_limit"></span></span></div><div class="progress-bar"><div class="progress-fill" id="view_t_bar"></div></div><div style="text-align:right;margin-top:5px"><button class="btn btn-gray" style="font-size:0.7rem;padding:4px 8px" onclick="resetTraffic()">重置流量</button></div></div><div style="margin-top:25px;display:flex;justify-content:flex-end;"><button class="btn btn-primary" onclick="closeModal()">关闭</button></div></div></div>
 <div id="setModal" class="modal"><div class="modal-box"><div class="tab-header"><div class="tab-btn active" onclick="switchTab(0)">管理账户</div><div class="tab-btn" onclick="switchTab(1)">个性背景</div></div><div class="tab-content active" id="tab0"><label>用户名</label><input id="set_u" value="{{USER}}"><label>重置密码 (留空保持不变)</label><input id="set_p" type="password"><div style="margin-top:25px;display:flex;justify-content:flex-end;gap:12px"><button class="btn btn-gray" onclick="closeModal()">取消</button><button class="btn btn-primary" onclick="saveAccount()">确认修改</button></div></div><div class="tab-content" id="tab1"><label>PC端壁纸 URL</label><input id="bg_pc" value="{{BG_PC}}"><label>手机端壁纸 URL</label><input id="bg_mob" value="{{BG_MOBILE}}"><div style="margin-top:25px;display:flex;justify-content:flex-end;gap:12px"><button class="btn btn-gray" onclick="closeModal()">取消</button><button class="btn btn-primary" onclick="saveBg()">应用背景</button></div></div></div></div>
@@ -844,7 +822,7 @@ load();window.addEventListener('resize',render);
 "#;
 EOF
 
-echo -e -n "${CYAN}>>> 编译面板程序 (请耐心等待！)...${RESET}"
+echo -e -n "${CYAN}>>> 正在编译面板 (这需要一点时间)...${RESET}"
 OS_ARCH=$(uname -m)
 if [[ "$OS_ARCH" == "aarch64" ]]; then
     RUST_TRIPLE="aarch64-unknown-linux-gnu"
@@ -859,27 +837,26 @@ linker = "gcc"
 rustflags = ["-C", "link-arg=-fuse-ld=bfd"]
 EOF
 
-# 编译并检查
 cargo clean >/dev/null 2>&1
 cargo build --release > /tmp/panel_build.log 2>&1
 
-if [ $? -eq 0 ] && [ -f "target/release/realm-panel" ]; then
+if [ $? -eq 0 ] && [ -f "target/release/gost-panel" ]; then
     echo -e "${GREEN} [完成]${RESET}"
     echo -e -n "${CYAN}>>> 正在部署服务...${RESET}"
-    mv target/release/realm-panel "$PANEL_BIN"
+    mv target/release/gost-panel "$PANEL_BIN"
 else
     echo -e "${RED} [失败]${RESET}"
     echo -e "${RED}================ 错误详情 ================${RESET}"
     cat /tmp/panel_build.log
-    echo -e "${RED}==========================================${RESET}"
+    echo -e "${RED}===============================================${RESET}"
     exit 1
 fi
 
 rm -rf "$WORK_DIR"
 
-cat > /etc/systemd/system/realm-panel.service <<EOF
+cat > "$PANEL_SERVICE" <<EOF
 [Unit]
-Description=Realm Panel (Gost V3 Backend)
+Description=Gost Panel (Gost V3 Backend)
 After=network.target
 
 [Service]
@@ -897,16 +874,16 @@ WantedBy=multi-user.target
 EOF
 
 systemctl daemon-reload
-systemctl enable realm-panel >/dev/null 2>&1
-systemctl restart realm-panel >/dev/null 2>&1
+systemctl enable gost-panel >/dev/null 2>&1
+systemctl restart gost-panel >/dev/null 2>&1
 echo -e "${GREEN} [完成]${RESET}"
 
 IP=$(curl -s4 ifconfig.me || hostname -I | awk '{print $1}')
 echo -e ""
 echo -e "${GREEN}====================================${RESET}"
-echo -e "${GREEN}      ✅ 面板 (Gost V3) 部署成功     ${RESET}"
+echo -e "${GREEN}           ✅ Gost 面板部署成功！      ${RESET}"
 echo -e "${GREEN}====================================${RESET}"
 echo -e "访问地址 : ${YELLOW}http://${IP}:${PANEL_PORT}${RESET}"
 echo -e "默认用户 : ${YELLOW}${DEFAULT_USER}${RESET}"
 echo -e "默认密码 : ${YELLOW}${DEFAULT_PASS}${RESET}"
-echo -e "------------------------------------------"
+echo -e "------------------------------------"
