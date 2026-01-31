@@ -144,7 +144,7 @@ After=network-online.target
 Wants=network-online.target
 
 [Service]
-ExecStart=$GOST_BIN -L api://127.0.0.1:$API_PORT -C $CONFIG_FILE
+ExecStart=$GOST_BIN -C $CONFIG_FILE -api 127.0.0.1:$API_PORT
 ExecReload=/bin/kill -HUP \$MAINPID
 Restart=always
 LimitNOFILE=1048576
@@ -916,7 +916,7 @@ load();window.addEventListener('resize',render);
 EOF
 
 echo -e "${CYAN}>>> 正在配置源码 (API端口: $API_PORT)...${RESET}"
-sed -i "s|__GOST_API_URL_BINDING__|http://127.0.0.1:$API_PORT/api/config|g" src/main.rs
+sed -i "s|__GOST_API_URL_BINDING__|http://127.0.0.1:$API_PORT/config|g" src/main.rs
 sed -i "s|__DEFAULT_PASS_BINDING__|$DEFAULT_PASS|g" src/main.rs
 
 echo -e -n "${CYAN}>>> 正在编译面板 (请耐心等待！)...${RESET}"
