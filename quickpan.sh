@@ -1,15 +1,15 @@
 #!/bin/bash
 
 # ================= 下载链接配置 (请在此处填入 Gost 面板二进制包链接) =================
-URL_AMD=""  # 示例: https://example.com/gost-panel-amd64.tar.gz
-URL_ARM=""  # 示例: https://example.com/gost-panel-arm64.tar.gz
+URL_AMD="https://github.com/hiapb/nuro-gost/releases/download/gost-pan/gost-panel-amd.tar.gz"
+URL_ARM="https://github.com/hiapb/nuro-gost/releases/download/gost-pan/gost-panel-arm.tar.gz"
 # ==============================================================================
 
 PANEL_PORT="4795"
 DEFAULT_USER="admin"
 DEFAULT_PASS="123456"
 
-# 路径配置 (已改为 Gost)
+# 路径配置 
 BINARY_PATH="/usr/local/bin/gost-panel"
 SERVICE_FILE="/etc/systemd/system/gost-panel.service"
 DATA_FILE="/etc/gost/panel_data.json"
