@@ -11,6 +11,8 @@ GOST_BIN="/usr/local/bin/gost"
 CONFIG_FILE="/etc/gost/config.yaml"
 
 RULES_DB="/etc/gost/rules.conf"
+# [新增] 面板数据路径
+PANEL_DATA_FILE="/etc/gost/panel_data.json"
 
 SERVICE_FILE="/etc/systemd/system/gost.service"
 PANEL_SERVICE_FILE="/etc/systemd/system/gost-panel.service"
@@ -58,11 +60,39 @@ require_installed() {
   return 0
 }
 
+# ================= [新增] 静默同步函数 =================
+# 逻辑：只要检测到面板数据，就自动将其转换为 rules.conf
+# 即使没安装面板，也不会报错，只会静默跳过
+sync_panel_to_cli() {
+  if [ -f "$PANEL_DATA_FILE" ]; then
+    # 检查并静默安装 jq (处理 JSON 必须)
+    if ! command -v jq >/dev/null 2>&1; then
+       if [ -f /etc/debian_version ]; then
+         apt-get update >/dev/null 2>&1 && apt-get install -y jq >/dev/null 2>&1
+       elif [ -f /etc/redhat-release ]; then
+         yum install -y jq >/dev/null 2>&1
+       fi
+    fi
+
+    # 如果 jq 存在，则执行转换
+    if command -v jq >/dev/null 2>&1; then
+        # 提取数据并覆盖 rules.conf
+        jq -r '.rules[] | "\(.enabled)|\(.name)|\(.listen)|\(.remote)"' "$PANEL_DATA_FILE" 2>/dev/null | \
+        sed 's/^true/1/; s/^false/0/' > "$RULES_DB"
+    fi
+  fi
+}
+# =======================================================
+
 ensure_config_file() {
   mkdir -p "$GOST_DIR"
   if [ ! -f "$RULES_DB" ]; then
     touch "$RULES_DB"
   fi
+  
+  # [调用] 每次操作前先同步
+  sync_panel_to_cli
+
   if [ ! -f "$CONFIG_FILE" ]; then
     regenerate_gost_config
   fi
@@ -234,6 +264,11 @@ get_status_line() {
   else
     echo -e "状态：${RED}未运行${RESET}  |  版本：${GREEN}${ver}${RESET}"
   fi
+  
+  # 检测面板并提示（可选，这里我保留提示因为不影响静默操作，但你可以看到它在运行）
+  if [ -f "$PANEL_DATA_FILE" ]; then
+     echo -e "面板：${GREEN}已检测到面板数据 (已自动同步)${RESET}"
+  fi
 }
 
 # ================= 安装逻辑 =================
@@ -391,7 +426,8 @@ EOF
 # ================= 规则管理逻辑 =================
 
 print_rules_pretty() {
-  ensure_config_file
+  ensure_config_file # [调用] 这里也会自动同步面板数据，不需要额外警告
+  
   if [ ! -s "$RULES_DB" ]; then
     echo -e "${YELLOW}暂无转发规则。${RESET}"
     return 1
@@ -575,7 +611,10 @@ export_rules() {
       FILES_TO_BACKUP="$FILES_TO_BACKUP panel_data.json"
   fi
   
-  tar -czf "$OUT" -C "$GOST_DIR" $FILES_TO_BACKUP
+  cd "$GOST_DIR"
+  tar -czf "$OUT" $FILES_TO_BACKUP
+  cd - >/dev/null
+
   if [ -s "$OUT" ]; then
     echo -e "${GREEN}导出成功：$OUT${RESET}"
   else
@@ -594,6 +633,10 @@ import_rules() {
   case "$ANS" in y|Y) ;; *) return ;; esac
   
   tar -xzf "$IN" -C "$GOST_DIR"
+  
+  # 导入后，立即同步一次面板数据
+  sync_panel_to_cli
+  
   regenerate_gost_config
   echo -e "${GREEN}导入成功并已重载配置。${RESET}"
 }
@@ -637,7 +680,8 @@ FILES="rules.conf config.yaml"
 if [ -f "\$CONFIG_DIR/panel_data.json" ]; then
     FILES="\$FILES panel_data.json"
 fi
-tar -czf "\$OUT" -C "\$CONFIG_DIR" \$FILES 2>/dev/null
+cd "\$CONFIG_DIR"
+tar -czf "\$OUT" \$FILES 2>/dev/null
 # 保留最近8份
 ls -tp "\$BACKUP_DIR"/gost-backup.*.tar.gz 2>/dev/null | tail -n +8 | xargs -I {} rm -- "{}"
 EOF
@@ -701,6 +745,7 @@ install_ftp(){
     echo -e "${YELLOW}默认备份文件：${DEFAULT_EXPORT_FILE}${RESET}"
     bash <(curl -L https://raw.githubusercontent.com/hiapb/ftp/main/back.sh)
     sleep 2
+    exit 0
 }
 
 # ================= 面板管理 =================
@@ -760,6 +805,9 @@ manage_panel() {
 
 main_menu() {
   check_root
+  # 启动时先同步一次，确保数据最新
+  sync_panel_to_cli 
+
   while true; do
     echo -e "${GREEN}===== Gost V3 转发管理脚本 =====${RESET}"
     get_status_line
