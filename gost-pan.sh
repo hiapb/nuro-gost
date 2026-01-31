@@ -200,11 +200,10 @@ use std::{fs, process::Command, sync::{Arc, Mutex}, path::Path as FilePath, time
 use tower_cookies::{Cookie, Cookies, CookieManagerLayer};
 use chrono::prelude::*;
 
-// 路径配置：必须与 Bash 脚本一致
+
 const GOST_CONFIG: &str = "/etc/gost/config.yaml";
 const DATA_FILE: &str = "/etc/gost/panel_data.json";
 
-// IPTABLES 链名称
 const CHAIN_IN: &str = "GOST_IN";
 const CHAIN_OUT: &str = "GOST_OUT";
 
@@ -263,8 +262,7 @@ async fn main() {
         data: Mutex::new(initial_data),
         last_traffic_map: Mutex::new(HashMap::new()),
     });
-    
-    // 初始化：同步防火墙规则并生成 Gost 配置
+
     {
         let data = state.data.lock().unwrap();
         flush_firewall_chains(); 
@@ -463,7 +461,6 @@ fn save_json(data: &AppData) {
     let _ = fs::write(DATA_FILE, json_str);
 }
 
-// 核心逻辑：生成 Gost v3 YAML 配置并热重载
 fn save_config_gost(data: &AppData) {
     let mut services = vec![];
     let mut chains = vec![];
@@ -473,7 +470,7 @@ fn save_config_gost(data: &AppData) {
 
         let chain_name = format!("chain-{}", rule.id);
         
-        // 1. 创建转发链
+
         chains.push(json!({
             "name": chain_name,
             "hops": [
@@ -487,7 +484,6 @@ fn save_config_gost(data: &AppData) {
             ]
         }));
 
-        // 2. 创建 TCP 服务
         services.push(json!({
             "name": format!("service-{}-tcp", rule.id),
             "addr": rule.listen,
@@ -495,7 +491,6 @@ fn save_config_gost(data: &AppData) {
             "listener": { "type": "tcp" }
         }));
 
-        // 3. 创建 UDP 服务
         services.push(json!({
             "name": format!("service-{}-udp", rule.id),
             "addr": rule.listen,
@@ -513,7 +508,6 @@ fn save_config_gost(data: &AppData) {
         let _ = fs::write(GOST_CONFIG, yaml_str);
     }
 
-    // 热重载 Gost (SIGHUP)
     let _ = Command::new("systemctl").arg("reload").arg("gost").status();
 }
 
@@ -822,7 +816,7 @@ load();window.addEventListener('resize',render);
 "#;
 EOF
 
-echo -e -n "${CYAN}>>> 正在编译面板 (这需要一点时间)...${RESET}"
+echo -e -n "${CYAN}>>> 正在编译面板 (请耐心等待！)...${RESET}"
 OS_ARCH=$(uname -m)
 if [[ "$OS_ARCH" == "aarch64" ]]; then
     RUST_TRIPLE="aarch64-unknown-linux-gnu"
