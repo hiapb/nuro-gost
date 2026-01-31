@@ -912,6 +912,7 @@ async function doRestore(){try{const p=JSON.parse($('restore_input').value);if(!
 setInterval(load, 3000);
 load();window.addEventListener('resize',render);
 </script></body></html>
+"#;
 EOF
 
 echo -e "${CYAN}>>> 正在配置源码 (API端口: $API_PORT)...${RESET}"
