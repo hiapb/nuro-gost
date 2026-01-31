@@ -9,7 +9,7 @@ DEFAULT_PASS="123456"
 # 核心路径配置
 GOST_BIN="/usr/local/bin/gost"
 CONFIG_FILE="/etc/gost/config.yaml"
-# 引入中间数据库文件，用于完美模拟 Realm 的管理体验
+
 RULES_DB="/etc/gost/rules.conf"
 
 SERVICE_FILE="/etc/systemd/system/gost.service"
@@ -116,10 +116,10 @@ port_in_use_system() {
   return 1
 }
 
-# 检查配置冲突 (检查 RULES_DB)
+# 检查配置冲突
 config_port_conflict() {
   local port="$1"
-  local exclude_idx="${2:-}" # 排除的行号(修改时用)
+  local exclude_idx="${2:-}" # 
   
   local i=1
   while IFS='|' read -r status name listen remote; do
@@ -554,7 +554,6 @@ edit_rule() {
   
   # 更新数据库
   local new_line="$status|$name|$listen|$remote"
-  # 这里需要处理一下转义问题，最稳妥是用 awk 或先删除后插入，简单起见用 sed (只要名称里没特殊符号)
   sed -i "${IDX}s|.*|$new_line|" "$RULES_DB"
   
   regenerate_gost_config
@@ -739,20 +738,18 @@ manage_panel() {
         1)
             echo "--------------------"
             echo "选择安装方式："
-            echo "1. 快速安装部署 (预留)"
-            echo "2. 自编译部署 (预留)"
+            echo "1. 快速安装部署"
+            echo "2. 自编译部署"
             echo "0. 返回"
             read -p "请选择 [0-2]: " INST_OPT
             case "$INST_OPT" in
-                # TODO: 替换为实际的 Gost 面板安装脚本 URL
-                1) echo "请先配置正确的脚本地址" ;; 
-                2) echo "请先配置正确的脚本地址" ;;
+                1) bash <(curl -fsSL https://raw.githubusercontent.com/hiapb/nuro-gost/main/quickpan.sh) ;; 
+                2) bash <(curl -fsSL https://raw.githubusercontent.com/hiapb/nuro-gost/main/gost-pan.sh) ;;
                 *) return ;;
             esac
             ;;
         2)
-            # TODO: 替换为实际的卸载脚本
-            echo "请先配置正确的卸载脚本地址"
+           bash <(curl -fsSL https://raw.githubusercontent.com/hiapb/nuro-gost/main/unpan.sh)
             ;;
         3) update_panel_port ;;
         *) return ;;
